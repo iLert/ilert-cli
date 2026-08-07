@@ -5,3 +5,5 @@
 
 # Top-level scratch and working directories.
 /_*
+
+x_builds/
