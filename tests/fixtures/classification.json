@@ -1,0 +1,99 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Classification and validation fixture",
+    "version": "1.0.0",
+    "description": "A deliberately small spec covering the cases the real ilert spec does not exercise: an operation that is destructive without being a DELETE, required non-path parameters, a required request body, and a header parameter whose name is reserved."
+  },
+  "servers": [{ "url": "/api" }],
+  "paths": {
+    "/vaults": {
+      "get": {
+        "operationId": "listVaults",
+        "tags": ["vaults"],
+        "summary": "List vaults",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": true,
+            "description": "ISO timestamp to list from",
+            "schema": { "type": "string" }
+          }
+        ]
+      }
+    },
+    "/vaults/{id}": {
+      "put": {
+        "operationId": "rekeyVault",
+        "tags": ["vaults"],
+        "summary": "Re-key a vault, discarding anything encrypted with the old key",
+        "x-ilert-cli-classification": { "destructive": true },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["key"],
+                "properties": { "key": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vaults/{id}/lock": {
+      "post": {
+        "operationId": "lockVault",
+        "tags": ["vaults"],
+        "summary": "Lock a vault",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "description": "Version the caller expects to be locking",
+            "schema": { "type": "string" }
+          }
+        ]
+      }
+    },
+    "/audits/{id}": {
+      "get": {
+        "operationId": "auditVault",
+        "tags": ["audits"],
+        "summary": "Read a vault's audit log",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "description": "A spec that asks the caller to set a reserved header. It must not be honoured.",
+            "schema": { "type": "string" }
+          }
+        ]
+      }
+    }
+  }
+}

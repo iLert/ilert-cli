@@ -1,0 +1,71 @@
+[package]
+name = "ilert"
+version = "0.1.0"
+edition = "2024"
+description = "The official ilert CLI"
+authors = ["ilert maintainers <support@ilert.com>"]
+license = "Apache-2.0"
+
+[[bin]]
+name = "ilert"
+path = "src/main.rs"
+
+[dependencies]
+# CLI framework
+clap = { version = "4.6", features = ["derive", "string"] }
+clap_complete = "4.6"
+
+# Async runtime & HTTP
+tokio = { version = "1.53", features = ["full"] }
+reqwest = { version = "0.13", features = ["json", "form", "query", "rustls"], default-features = false }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Output formatting
+tabled = "0.21"
+colored = "3.1"
+
+# Interactive prompts
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+indicatif = "0.18"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Config & paths
+directories = "6.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Secret storage (OS keyring)
+# The default `v1` feature pulls in the per-platform stores (Keychain on macOS,
+# Credential Manager on Windows, secret-service elsewhere) and installs one as
+# the default store on first `Entry::new` — no store wiring needed here.
+keyring = "4.1"
+
+# OAuth (PKCE) + browser launch
+sha2 = "0.11"
+base64 = "0.23"
+rand = "0.10"
+open = "5.4"
+url = "2.5"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+[dev-dependencies]
+wiremock = "0.6"
+assert_cmd = "2.2"
+predicates = "3.1"
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["full", "test-util"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

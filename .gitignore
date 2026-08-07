@@ -1,0 +1,7 @@
+/target
+
+.claude/
+.idea/
+
+# Top-level scratch and working directories.
+/_*
