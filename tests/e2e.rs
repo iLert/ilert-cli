@@ -151,7 +151,7 @@ async fn auth_login_oauth_browser_flow() {
             "token_type": "Bearer",
             "access_token": "oauth-access-token",
             "expires_in": 3600,
-            "scope": "wildcard offline_access",
+            "scope": "wildcard:d offline_access",
             "refresh_token": "oauth-refresh-token",
             "refresh_token_expires_in": 31536000
         })))
@@ -167,13 +167,16 @@ async fn auth_login_oauth_browser_flow() {
         .success()
         .stderr(predicate::str::contains("via OAuth"));
 
-    // Stored credential is OAuth with the granted scopes.
+    // Stored credential is OAuth with the granted scopes, and the refresh token
+    // from the response is actually persisted — without it the session dies at
+    // the access token's TTL and the user is silently logged out.
     h.cmd()
         .args(["auth", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains("oauth"))
-        .stdout(predicate::str::contains("wildcard"));
+        .stdout(predicate::str::contains("wildcard"))
+        .stdout(predicate::str::contains("present"));
 
     // The access token is used as the Bearer for API calls.
     Mock::given(method("GET"))
@@ -206,7 +209,7 @@ async fn oauth_access_token_is_refreshed_when_expired() {
             "refresh_token": "old-refresh-token",
             "expires_at": "2000-01-01T00:00:00Z",
             "token_type": "Bearer",
-            "scopes": ["wildcard"]
+            "scopes": ["wildcard:d"]
         }),
     );
 
@@ -218,7 +221,7 @@ async fn oauth_access_token_is_refreshed_when_expired() {
             "token_type": "Bearer",
             "access_token": "fresh-access-token",
             "expires_in": 3600,
-            "scope": "wildcard offline_access",
+            "scope": "wildcard:d offline_access",
             "refresh_token": "new-refresh-token",
             "refresh_token_expires_in": 31536000
         })))

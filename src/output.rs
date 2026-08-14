@@ -4,6 +4,7 @@ use colored::Colorize;
 use serde_json::Value;
 use tabled::builder::Builder;
 use tabled::settings::Style;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputFormat {
@@ -301,12 +302,32 @@ fn format_cell(value: Option<&Value>) -> String {
     }
 }
 
+/// Truncate to `max` terminal columns, appending an ellipsis when it doesn't fit.
+///
+/// Measured in display width, not bytes: byte slicing panics mid-codepoint on
+/// any multi-byte character (an umlaut in an alert summary was enough), and
+/// counting `char`s still misaligns the table for CJK and emoji, which occupy
+/// two columns each.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
+    let width = s.width();
+    if width <= max {
+        return s.to_string();
     }
+    // Reserve three columns for the ellipsis. `max` is a small constant here, but
+    // guard anyway so a tight budget degrades instead of underflowing.
+    let budget = max.saturating_sub(3);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push_str("...");
+    out
 }
 
 pub fn print_error(err: &anyhow::Error, format: OutputFormat) {
@@ -340,5 +361,90 @@ pub fn print_error(err: &anyhow::Error, format: OutputFormat) {
                 serde_json::to_string_pretty(&error_json).unwrap_or_default()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_values_untouched() {
+        assert_eq!(truncate("short", 48), "short");
+        // Exactly at the limit: still no ellipsis.
+        let exact = "a".repeat(48);
+        assert_eq!(truncate(&exact, 48), exact);
+    }
+
+    #[test]
+    fn truncate_does_not_split_multibyte_chars() {
+        // Regression: 25 umlauts are 50 *bytes* but only 25 columns. The old
+        // byte-based check treated that as over-long and sliced at byte 45,
+        // panicking mid-codepoint ("not a char boundary"). It fits — leave it be.
+        let fits = "ä".repeat(25);
+        assert_eq!(truncate(&fits, MAX_CELL_WIDTH), fits);
+
+        // Genuinely too wide: truncate on a char boundary, never inside one.
+        let long = "ä".repeat(60);
+        let out = truncate(&long, MAX_CELL_WIDTH);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.width(), MAX_CELL_WIDTH);
+        assert!(out.chars().all(|c| c == 'ä' || c == '.'));
+    }
+
+    #[test]
+    fn truncate_measures_display_width_not_bytes() {
+        // Wide (2-column) characters must not overflow the cell.
+        let wide = "世".repeat(40);
+        let out = truncate(&wide, MAX_CELL_WIDTH);
+        assert!(out.width() <= MAX_CELL_WIDTH);
+
+        // An emoji straddling the budget boundary is dropped, never split.
+        let emoji = format!("{}🚨", "a".repeat(44));
+        let out = truncate(&emoji, MAX_CELL_WIDTH);
+        assert!(out.width() <= MAX_CELL_WIDTH);
+    }
+
+    #[test]
+    fn colored_cells_do_not_inflate_column_width() {
+        // Guards the `tabled/ansi` feature: without it the escape sequences are
+        // counted as visible width and every colored column misaligns.
+        colored::control::set_override(true);
+        let colored_row = colorize_value("status", "PENDING");
+        colored::control::set_override(false);
+
+        assert!(colored_row.contains('\u{1b}'), "expected ANSI escapes");
+        let mut builder = Builder::default();
+        builder.push_record(["status".to_string()]);
+        builder.push_record([colored_row]);
+        let mut table = builder.build();
+        table.with(Style::rounded());
+        let rendered = table.to_string();
+
+        // Every border row must be the same display width as the header row.
+        let widths: Vec<usize> = rendered.lines().map(console_width).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "misaligned table rows: {widths:?}\n{rendered}"
+        );
+    }
+
+    /// Display width of a rendered line, ignoring ANSI escape sequences.
+    fn console_width(line: &str) -> usize {
+        let mut width = 0;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // Skip the CSI sequence up to and including its final byte.
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            width += c.width().unwrap_or(0);
+        }
+        width
     }
 }

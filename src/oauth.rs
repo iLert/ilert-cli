@@ -30,7 +30,11 @@ pub const REDIRECT_URI: &str = "http://localhost:4597/callback";
 
 /// Space-separated OAuth scopes. `offline_access` is required to receive a
 /// refresh token under PKCE;
-pub const SCOPES: &str = "wildcard offline_access";
+///
+/// The `:d` suffix on `wildcard` is load-bearing: ilert reads the suffix as the
+/// permission level, and a bare scope grants read-only. `:d` is read + write +
+/// delete — the CLI needs all three, since it exposes destructive operations.
+pub const SCOPES: &str = "wildcard:d offline_access";
 
 // OAuth2 endpoint paths.
 const AUTHORIZE_PATH: &str = "/api/developers/oauth2/authorize";
@@ -680,6 +684,30 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert_eq!(code_challenge(verifier), expected);
+    }
+
+    #[test]
+    fn scopes_request_write_and_delete_permission() {
+        // Regression: ilert reads the `:w`/`:d` suffix as the permission level,
+        // so a bare `wildcard` mints a read-only token.
+        assert!(
+            SCOPES.split_whitespace().any(|s| s == "wildcard:d"),
+            "SCOPES must request wildcard:d, got: {SCOPES}"
+        );
+        // Required for a refresh token under PKCE.
+        assert!(SCOPES.split_whitespace().any(|s| s == "offline_access"));
+    }
+
+    #[test]
+    fn authorize_url_carries_suffixed_scope() {
+        let url = build_authorize_url("https://app.ilert.com", "challenge", "state").unwrap();
+        let parsed = Url::parse(&url).unwrap();
+        let scope = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+            .expect("scope param");
+        assert_eq!(scope, SCOPES);
     }
 
     #[test]
