@@ -3,18 +3,18 @@
   "skills": [
     {
       "name": "migrate-from-opsgenie",
-      "description": "Map Opsgenie resources onto ilert equivalents, including the mappings that silently change semantics",
+      "description": "Map Opsgenie resources onto ilert equivalents",
       "path": "migrate-from-opsgenie/SKILL.md"
     },
     {
       "name": "migrate-from-pagerduty",
-      "description": "Map PagerDuty resources onto ilert equivalents, including the mappings that silently change semantics",
+      "description": "Map PagerDuty resources onto ilert equivalents",
       "path": "migrate-from-pagerduty/SKILL.md"
     },
     {
-      "name": "migrate-from-statuspage",
-      "description": "Map Statuspage.io pages, components and incidents onto ilert status pages, including the mappings that silently change semantics",
-      "path": "migrate-from-statuspage/SKILL.md"
+      "name": "migrate-from-statuspageio",
+      "description": "Map Statuspageio (Atlassian Statuspage) resources onto ilert status page equivalents",
+      "path": "migrate-from-statuspageio/SKILL.md"
     }
   ]
 }

@@ -1,6 +1,6 @@
 ---
 name: migrate-from-opsgenie
-description: Map Opsgenie resources onto ilert equivalents, including the mappings that silently change semantics
+description: Map Opsgenie resources onto ilert equivalents
 user-invocable: true
 ---
 
@@ -9,8 +9,7 @@ user-invocable: true
 The hard part is not the object mapping — it is that the two products route
 alerts through different objects. Opsgenie routes **team-first**; ilert routes
 **source-first**. A simple setup maps one-to-one, but any configuration that
-leaned on team routing rules routes differently after a faithful field-by-field
-import — and parts of it will not route at all.
+leaned on team routing rules routes differently after a faithful field-by-field import.
 
 ## The routing model difference
 
@@ -19,70 +18,111 @@ rules decide which escalation applies, with alert/notification policies filterin
 along the way.
 
 In ilert the **Alert Source** owns the escalation policy directly. There is no
-object equivalent to a team routing rule, but three mechanisms cover the same
-ground, and choosing between them decides how many objects you end up creating:
+object equivalent to a team routing rule, but two mechanisms between them absorb
+almost every routing rule you will find, and they are where to look first:
 
-* **Routing keys.** An Escalation Policy carries a `routingKey`. An event that
-  supplies a matching key overrides the alert source's own policy. Keys are
-  comma-separated and evaluated left to right, falling back to the source's
-  policy when none match, and the key can be pulled from the payload with the
-  alert source's `routingTemplate`. This is the closest analogue to a routing
-  rule: one alert source, several escalation paths.
-* **Event Flows.** For branches expressible as a filter on event content.
-* **Additional alert sources.** One per escalation path — needed when the branch
-  depends on something the emitter cannot signal in its payload.
+* **Routing keys — when the emitter can name the branch it wants.** An Escalation
+  Policy carries a `routingKey`. An event supplying a matching key overrides the
+  alert source's own policy. Keys are comma-separated and evaluated left to
+  right, falling back to the source's policy when none match, and the key can be
+  pulled from the payload with the alert source's `routingTemplate`. One alert
+  source, several escalation paths, no extra objects.
+
+* **Event Flows — for everything else.** This is the general answer whenever an
+  Opsgenie rule has no direct equivalent in an alert source setting. An Event Flow is a routing layer
+  that sits *above* alert sources rather than beside them: it has its own
+  `integrationKey` / `integrationUrl`, so emitters post to the **flow** instead
+  of to a source, as a drop-in replacement for a source URL at the sender. Inside
+  it is a tree of nodes:
+
+  | Node | What it does                                                                                                                                                                  |
+  | --- |-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+  | `DEFINE_BRANCHES` | Conditions over the event body (`context.event.summary`, `context.event.customDetails.…`), AND/OR groups, evaluated in order — first match wins, with a `CATCH_ALL` else path |
+  | `ROUTE_EVENT` | Hands the event to an alert source, optionally overriding that source's `escalationPolicyId` and `overwritePriority` for this branch                                          |
+  | `SUPPORT_HOURS` | Branches on whether the event arrived inside a support-hours window                                                                                                           |
+  | `WAIT` | Holds the event before the next node runs, also capable of dropping delayed events when a following ACCEPT/RESOLVE arrives with a matching alertKey                           |
+  | `TRANSFORM` | Rewrites fields before routing (`SET`, `COPY`, `MAP`, `TEMPLATE`, `MERGE`, `APPEND_ARRAY`)                                                                                    |
+
+   > Other nodes might be available based on api-docs
+
+  `ROUTE_EVENT` is the piece that does the real work: it lets **one** alert source
+  serve many escalation paths, chosen per branch, which is exactly what an
+  Opsgenie team routing rule did. `SUPPORT_HOURS` covers the time-based branches
+  the emitter could never have signaled, and `TRANSFORM` is where an Opsgenie
+  *alert policy* lands. (but remember: for simple routings `routingKey` on the alert source is the best approach and event flow an overkill).
+
+Reach for **additional alert sources** only when branches genuinely need
+different *source-level* settings — a different `integrationType`,
+`alertCreation` mode or `autoResolutionTimeout`. Those live on the source and a
+flow cannot override them; `ROUTE_EVENT` overrides escalation policy and priority
+and nothing else. That is the real dividing line, and it is a much narrower
+reason to multiply sources than "the routing differs".
 
 Teams in ilert carry no routing rules, but they are not purely decorative: an
 escalation rule can target a team directly, so teams do appear in notification
 paths.
 
-Flatten the routing rules first, on paper, before creating anything. The count of
-alert sources is a migration decision, not a translation.
+Flatten the routing rules first, on paper, before creating anything. The usual
+landing place is one Event Flow plus a handful of alert sources — not one source
+per rule. The count of alert sources is a migration decision, not a translation.
 
 ## Resource mapping
 
-| Opsgenie | ilert | Notes |
-| --- | --- | --- |
-| Integration | Alert Source | Carries `escalationPolicy`, `integrationKey`, `integrationUrl` |
-| API key / integration key | Alert Source `integrationKey` | New value; every emitter must be re-pointed |
-| Team | Team | Visibility and ownership; carries no routing rules, but can be an escalation rule target |
-| Team routing rule | Escalation Policy `routingKey`, Event Flow, or additional Alert Source | No single equivalent — see above |
-| Escalation | Escalation Policy | Rules hold `escalationTimeout` plus `users` / `schedules` / `teams` |
-| Schedule | Schedule | `type` is `STATIC` or `RECURRING` |
-| Rotation | `scheduleLayers` | On `RECURRING` schedules |
-| Override | Shift, via `PUT /schedules/{id}/overrides` | Same `Shift` payload as a schedule shift, but its own endpoint; must not be in the past |
-| Alert | Alert | `PENDING` → `ACCEPTED` → `RESOLVED` |
-| Alert `alias` | Alert `alertKey` | Deduplication identity |
-| Incident (Incident Management) | Incident | Internal coordination on both sides: responders who are paged, associated/linked alerts, notes and timeline |
-| Incident `responders` | Incident responders | ilert pages via escalation policy, schedule, individual or whole team |
-| Incident `statusPageEntry` | Status update | The public half of an Opsgenie incident is a separate object in ilert, with its own `/status-updates` endpoint — see below |
-| Incident rule (auto-create from alert) | *(no rule engine)* | ilert incidents are declared by a caller — UI, API or MCP — from scratch or from an alert |
+| Opsgenie | ilert | Notes                                                                                                                                     |
+| --- | --- |-------------------------------------------------------------------------------------------------------------------------------------------|
+| Integration | Alert Source | Carries `escalationPolicy`, `integrationKey`, `integrationUrl`                                                                            |
+| API key / integration key | Alert Source `integrationKey` | New value; every emitter must be re-pointed                                                                                               |
+| Team | Team | Visibility and ownership; carries no routing rules, but can be an escalation rule target                                                  |
+| Team routing rule | Event Flow, or Escalation Policy `routingKey` | No single equivalent, but an Event Flow covers nearly all of it — see above                                                               |
+| Escalation | Escalation Policy | Rules hold `escalationTimeout` plus `users` / `schedules` / `teams`                                                                       |
+| Schedule | Schedule | `type` is `STATIC` or `RECURRING`                                                                                                         |
+| Rotation | `scheduleLayers` | On `RECURRING` schedules                                                                                                                  |
+| Override | Shift, via `PUT /schedules/{id}/overrides` | Same `Shift` payload as a schedule shift, but its own endpoint; must not be in the past                                                   |
+| Alert | Alert | `PENDING` → `ACCEPTED` → `RESOLVED`                                                                                                       |
+| Alert `alias` | Alert `alertKey` | Deduplication identity                                                                                                                    |
+| Incident (Incident Management) | Incident | Internal coordination on both sides: responders who are paged, associated/linked alerts, notes and timeline                               |
+| Incident `responders` | Incident responders | ilert pages via escalation policy, schedule, individual or whole team                                                                     |
+| Incident `statusPageEntry` | Status update | The public half of an Opsgenie incident is a separate object in ilert, with its own `/status-updates` endpoint — see below                |
+| Incident rule (auto-create from alert) | `ilert incidents` Alert Action on the alert source | Automatic and conditional — see below; incidents can also be declared by a caller from the UI, API or MCP                                 |
 | Service | Service | Not only a status-page component: also attached to alert sources (`services`, `autoCreateServices`) and to incidents as affected services |
-| Status page | Status Page | |
-| User | User | |
-| Contact method | Contact | Separate objects per channel |
-| Notification rule | Notification Preference | Split by priority *and* by notification type |
-| Alert policy (`modify`) | Event Flow | Priority overrides, field rewriting, responder assignment |
-| Notification policy (auto-close, dedup, delay) | Alert Source settings + Event Flow | Split across two places |
-| Maintenance | Maintenance Window | |
-| Heartbeat | Heartbeat Monitor | |
-| Incoming call routing | Call Flow + Call Flow Number | A whole product area, easily forgotten — see below |
-| Forwarding rule | Schedule override, per schedule | Narrower than Opsgenie's, and not a single object — see below |
-| Custom user role | `Role` / `TeamRole` | Fixed enums (`ADMIN`, `USER`, `RESPONDER`, `STAKEHOLDER`, `GUEST`), not composable rights — lossy |
-| Team member + team role | `/teams/{id}/members` with `TeamRole` | |
-| Who is on call | `/on-calls` | Not a migrated object; the endpoint to verify coverage after import |
-| Action / outgoing webhook | Alert Action + Connector | Connector holds credentials, Alert Action the binding |
-| Priority P1–P5 | Alert priority `HIGH` / `LOW` | Lossy — see below |
-| Escalation rule `delay.timeAmount` | Escalation rule `escalationTimeout` | Per rule on both sides; minutes on both sides |
-| Escalation `repeat` | Escalation Policy `repeating` / `frequency` | Moves from the escalation to the policy — see below |
+| Status page | Status Page | Page metrics map to `Metric` + `Metric Data Source`; see the `migrate-from-statuspageio` skill for the page-side detail                   |
+| Incident template | Incident Template | `sendNotification` on the template decides whether subscribers are notified                                                               |
+| *(no equivalent)* | Deployment Event + Deployment Pipeline | Capability gained, not migrated — see below                                                                                               |
+| User | User |                                                                                                                                           |
+| Contact method | Contact | Separate objects per channel                                                                                                              |
+| Notification rule | Notification Preference | Split by priority *and* by notification type                                                                                              |
+| Alert policy (`modify`) | Event Flow `TRANSFORM` node, or `ROUTE_EVENT` `overwritePriority` | Field rewriting and priority overrides                                                                                                    |
+| Notification policy (auto-close, dedup) | Alert Source `autoResolutionTimeout`, `alertCreation`, `alertGroupingWindow` | Source-level only; a flow cannot override these                                                                                           |
+| Notification policy (delay) | Escalation Policy `delayMin` | Delayed escalation — a third place; see below                                                                                             |
+| Maintenance | Maintenance Window |                                                                                                                                           |
+| Heartbeat | Heartbeat Monitor |                                                                                                                                           |
+| Incoming call routing | Call Flow + Call Flow Number | A whole product area, easily forgotten — see below                                                                                        |
+| Forwarding rule | Schedule override, per schedule | Narrower than Opsgenie's, and not a single object — see below                                                                             |
+| Custom user role | `Role` / `TeamRole` | Fixed enums (`ADMIN`, `USER`, `RESPONDER`, `STAKEHOLDER`, `GUEST`), (custom rbac roles require Enterprise plan)                           |
+| Team member + team role | `/teams/{id}/members` with `TeamRole` |                                                                                                                                           |
+| Who is on call | `/on-calls` | Not a migrated object; the endpoint to verify coverage after import                                                                       |
+| Action / outgoing webhook | Alert Action + Connector | Connector holds credentials, Alert Action the binding                                                                                     |
+| Priority P1–P5 | Alert severity, integer `1`–`5` on the event (displayed `SEV1`–`SEV5`) | One for one — see below; priority `HIGH`/`LOW` is a separate, two-valued field                                                            |
+| Escalation rule `delay.timeAmount` | Escalation rule `escalationTimeout` | Per rule on both sides; minutes on both sides                                                                                             |
+| Escalation `repeat` | Escalation Policy `repeating` / `frequency` | Moves from the escalation to the policy — see below                                                                                       |
 
 ## Mappings that silently change behaviour
 
-**Priority collapses to two values.** ilert has `HIGH` and `LOW`. A common,
-defensible split is P1/P2 → `HIGH` and P3–P5 → `LOW`, but confirm it against how
+**Priority does not collapse — severity carries the level.** Opsgenie's single
+P1–P5 field splits across two ilert fields, and both are worth setting.
+**Severity** is a five-level scale, so P1–P5 maps one for one and nothing is
+lost. On the wire it is an **integer 1–5** (`1` most severe), rendered
+`SEV1`–`SEV5` in the UI — sending `"P1"` or `"SEV1"` is a validation error, so map
+numerically. Set it per event with `severity`, or let the alert source's
+`severityTemplate` derive it from the payload; the event value overwrites the
+template's. **Priority** is separately two-valued (`HIGH` / `LOW`) and is
+what actually drives notification and escalation behaviour, so it needs its own
+decision: a common, defensible split is P1/P2 → `HIGH` and P3–P5 → `LOW`, set via
+`priorityTemplate` or `alertPriorityRule`. Confirm that split against how
 notification rules were actually written in Opsgenie, not against the label
-names. Keep the original level in the payload and map it through the alert
-source's `priorityTemplate` if you need it for reporting.
+names — and note that it is now a routing decision only, not a lossy one, because
+the original level survives in severity. Incidents use the same `SEV1`–`SEV5`
+scale and default to `SEV3`.
 
 **Close and acknowledge are renamed, not redefined.** Opsgenie's *close* becomes
 ilert's *resolve*; *acknowledge* becomes *accept*. Both products allow closing or
@@ -91,14 +131,23 @@ history afterwards — the lifecycle is the same shape, so do not budget for a
 behavioural change here. What does break is anything reading the values:
 automation counting "acknowledged then closed" transitions has to be re-pointed
 at `ACCEPTED` and `RESOLVED`, and any report keyed on Opsgenie's five priorities
-has two values left to work with.
+has to read ilert's `severity`, not its `priority`.
 
-**Alert policies and notification policies split across two objects.** Opsgenie
+**Alert policies and notification policies split across three objects.** Opsgenie
 keeps de-duplication, auto-close and delay in *notification policies*, and field
-rewriting in *alert policies*. In ilert, de-duplication and auto-close are alert
-source settings (`alertCreation`, `alertGroupingWindow`, `autoResolutionTimeout`)
-while rewriting is an Event Flow. Half of each Opsgenie policy therefore lands in
-a different place. Reviewing only one of the two loses behaviour silently.
+rewriting in *alert policies*. In ilert those land in three different places:
+de-duplication and auto-close are alert source settings (`alertCreation`,
+`alertGroupingWindow`, `autoResolutionTimeout`), rewriting is an Event Flow
+`TRANSFORM` node, and
+**delay is `delayMin` on the Escalation Policy** — ilert's *delayed escalation*,
+which holds an alert for a set period and notifies nobody if it resolves inside the window. That last one is the natural home for an
+Opsgenie policy that deferred notification on flapping monitors, and it is easy
+to miss because it is the one piece that lives on the policy rather than on the
+source. An alert that self-resolves during the delay pages no one, but you can
+still record it — an Alert Action triggered on `alert-created` fires regardless.
+
+Each Opsgenie policy therefore scatters across objects. Reviewing only one of the
+three loses behaviour silently.
 
 The two also differ in scope, which decides what you can even find: Opsgenie
 notification policies exist only inside *team* policies, while alert policies
@@ -109,23 +158,24 @@ easy to miss entirely when migrating team by team.
 the easy half. What decides how many alerts you actually get is the alert
 source's `alertCreation` mode — it is the grouping rule, not a flag:
 
-| Mode | Opens a new alert |
-| --- | --- |
-| `ONE_ALERT_PER_EMAIL` | for every email |
-| `ONE_ALERT_PER_EMAIL_SUBJECT` | for every new email subject |
-| `ONE_PENDING_ALERT_ALLOWED` | unless one is already `PENDING` |
-| `ONE_OPEN_ALERT_ALLOWED` | unless one is already open — `PENDING` or `ACCEPTED` |
+| Mode | Opens a new alert                                                |
+| --- |------------------------------------------------------------------|
+| `ONE_ALERT_PER_EMAIL` | for every event                                                  |
+| `ONE_ALERT_PER_EMAIL_SUBJECT` | for every new event summary                                      |
+| `ONE_PENDING_ALERT_ALLOWED` | unless one is already `PENDING`                                  |
+| `ONE_OPEN_ALERT_ALLOWED` | unless one is already open — `PENDING` or `ACCEPTED`             |
 | `OPEN_RESOLVE_ON_EXTRACTION` | per alert key extracted from the payload, which also resolves it |
-| `ONE_ALERT_GROUPED_PER_WINDOW` | if the last one is older than `alertGroupingWindow` |
-| `INTELLIGENT_GROUPING` | if the last *similar* one is older than `alertGroupingWindow` |
+| `ONE_ALERT_GROUPED_PER_WINDOW` | if the last one is older than `alertGroupingWindow`              |
+| `INTELLIGENT_GROUPING` | if the last *similar* one is older than `alertGroupingWindow`    |
 
-The two email modes apply only to email sources, and `alertGroupingWindow` is
-consulted only by the last two. Opsgenie expresses the same intent through a
+Opsgenie expresses the same intent through a
 `notification-deduplication` policy that is value- or frequency-based, so there
 is no mode-for-mode correspondence to copy across. Decide per source what "the
-same alert" should mean and set the mode explicitly — the inherited default is
-`ONE_ALERT_PER_EMAIL_SUBJECT`, which is an email-shaped answer that rarely
-matches what an API or monitoring source wants.
+same alert" should mean and set the mode explicitly — the default is
+`ONE_ALERT_PER_EMAIL`, an event-shaped answer that means "every event opens a new
+alert". However, when an alertKey is present and matching an open alert it will be grouped regardless,
+using a dedicated integrationType  (not API e.g. PROMETHEUS) ilert will automatically extract alertKeys based
+on best practices - this is an often overlooked behavior.
 
 **Support hours downgrade, they do not suppress.** `alertPriorityRule` takes
 `HIGH`, `LOW`, `HIGH_DURING_SUPPORT_HOURS` or `LOW_DURING_SUPPORT_HOURS`. Setting
@@ -133,9 +183,19 @@ matches what an API or monitoring source wants.
 still created and still notify according to each user's `LOW` preferences. The
 larger change is that a `LOW` alert keeps only the **first** escalation rule: the
 level-one target is notified, and the alert never advances past it no matter how
-long it goes unaccepted. Opsgenie configurations that used time
-restrictions or a `notification-suppress` policy to mean "do not page" need the
-quiet part expressed in notification preferences, not in support hours.
+long it goes unaccepted. Opsgenie configurations that used time restrictions or a
+`notification-suppress` policy to mean "do not page" therefore cannot express the
+quiet part through support hours alone.
+
+There are two better homes for it, and which one you want depends on whether the
+alert should exist at all. If it should — visible, just not paging anyone — the
+quiet belongs in the recipients' **notification preferences**. If it genuinely
+should not exist, express it in an **Event Flow**: an event whose path never
+reaches a `ROUTE_EVENT` node is handed to no alert source and creates no alert,
+which is a real drop, and a `SUPPORT_HOURS` node in front of it makes that drop
+time-based. That is usually the closer match for a suppression policy, and unlike
+notification preferences it is configured centrally rather than per user — the
+event still shows in the flow's logs, so it stays auditable.
 
 Related, and easy to leave off: `autoRaiseAlerts` re-raises alerts still
 `PENDING` when support hours begin. An Opsgenie setup that deliberately deferred
@@ -151,38 +211,52 @@ responders, notes, impacted services — becomes the first. Migrating an Opsgeni
 incident to a status update alone silently drops the response side.
 
 Keep this in proportion. Opsgenie incident *records* are historical data, and
-historical alerts and incidents do not migrate anyway — so this mapping matters
+historical alerts and incidents might not need to migrate anyway — so this mapping matters
 for understanding the two models and for anything that creates incidents going
-forward, not for a bulk import. What it does mean concretely: Opsgenie's incident
-rules automatically open an incident when alert data matches a condition, and
-ilert has no rule engine that does this — every declare path runs on behalf of a
-caller. Teams that leaned on incident rules are giving up automation, not
-translating it.
+forward, not for a bulk import.
+
+Opsgenie's incident rules — open an incident automatically when alert data
+matches a condition — do translate. The equivalent is an **Alert Action** of type
+`ilert incidents` attached to the alert source, with `triggerMode` set to
+`AUTOMATIC`: it generates an incident and drives service status and status
+updates as alerts arrive, without a human in the loop. The status update it posts
+is built from an **Incident Template**, whose `sendNotification` flag decides
+whether subscribers are actually notified — set it deliberately, because an
+automated update that quietly pages a subscriber list is a very different thing
+from one that only repaints the page. The conditional half is
+`conditions`, an ICL expression evaluated against the alert, narrowed further by
+`triggerTypes` (`alert-created`, `alert-acknowledged`, `alert-escalation-ended`,
+…). Leave `triggerMode` on `MANUAL` and the same action becomes a button on the
+alert instead.
+
+What changes is where the rule lives and what it can see. Opsgenie evaluates
+incident rules centrally, per team; ilert attaches the action per alert source
+and evaluates it against that alert's own fields. So a single Opsgenie rule
+spanning several integrations becomes one action per alert source, and any
+condition that referenced state outside the alert has to be re-expressed in alert
+terms or left to a manual declare. Rebuild the rules — do not budget for losing
+them.
 
 **Forwarding rules have no global equivalent.** An Opsgenie forwarding rule
 redirects *everything* aimed at one user to another for a date range — whether
 that user was reached through a schedule, through an escalation rule, or by
-direct assignment. ilert's nearest tools are both narrower: a schedule
-**override** replaces a user on *one* schedule for a window, and a **coverage
-request** asks a colleague to accept specific shifts (mobile app only, and it
-must be accepted). Neither touches a user named directly as an escalation rule
-target. Before assuming an override reproduces a forwarding rule, enumerate every
-schedule and policy the forwarded user appears in — what looks like one object in
-Opsgenie is usually several in ilert, and the ones you miss still page the absent
-person.
+direct assignment. ilert mitigates the necessity for this, by providing bulk schedule-override
+options in My-on-calls or the coverage-request feature.
 
 **Call routing is its own migration.** Opsgenie's incoming call routing — a phone
 number that routes callers to on-call staff, with auto-attendant menus, voicemail
 and blocklists — maps onto ilert **Call Flows**: a tree of nodes (`IVR_MENU`,
 `AUDIO_MESSAGE`, `SUPPORT_HOURS`, `ROUTE_CALL`, `PARALLEL_ROUTE_CALL`,
-`VOICEMAIL`, `PIN_CODE`, `CREATE_ALERT`, `BLOCK_NUMBERS`) attached to a call flow
-number. The node structure transfers, but **the routing targets do not line up**:
+`VOICEMAIL`, `PIN_CODE`, `CREATE_ALERT`, `BLOCK_NUMBERS`, and more check the api-docs) attached to a call flow
+number. The node structure transfers, but **the routing targets do not line up exactly**:
 Opsgenie routes a call to a user, schedule, team or escalation policy, while an
-ilert `ROUTE_CALL` node targets only `USER`, `ON_CALL_SCHEDULE` or `NUMBER`. Any
-route that pointed at a team or an escalation policy has to be rebuilt — usually
+ilert `ROUTE_CALL` node targets `USER`, `ON_CALL_SCHEDULE`, `TEAM` or `NUMBER` (enterprise feature). Any
+route that pointed to an escalation policy has to be expanded or moved into a team — usually
 as the schedule behind it, which silently drops the escalation fallback when
 nobody answers. `callStyle` (`ORDERED`, `RANDOM`, `PARALLEL`), `retries` and
-`callTimeoutSec` on the node are where you rebuild part of that behaviour.
+`callTimeoutSec` on the node are where you rebuild part of that behaviour. Note
+that this choice is made in all clarity as policies contain escalation timeouts
+and a live incoming call should not be the victim of such timeouts.
 
 The number itself cannot come with you. **ilert call routing numbers cannot be
 ported in** — you provision a new ilert number, so the number your callers dial
@@ -193,20 +267,22 @@ new one. Enumerate who knows the old number before you start.
 
 Give call routing its own cutover and its own announcement — it is the one part
 of the migration with humans, not machines, on the other end, and the only part
-where the fallback is a caller who cannot get through.
+where the fallback is a caller who cannot get through. Other than that call flows
+offer immense freedom in customizability and empower any use-case imaginable.
 
 **`integrationType` changes payload parsing.** Opsgenie's generic API integration
 tempts a generic ilert source. Where a dedicated `integrationType` exists for the
 emitting system, use it: field extraction, link templates and bidirectional sync
-depend on it.
+depend on it. Alert source templates still allow customization on top of the integration defaults.
 
-**Escalation to an empty schedule falls through silently — and instantly.** An
+**Escalation to an empty schedule falls through — and instantly.** An
 escalation rule pointing at a schedule with nobody on call advances to the next
 rule *without waiting for the escalation timeout*, so a policy can burn through
 every level in the moment the alert arrives. If no one is on call anywhere in the
 policy, nobody is notified at all. Import schedules and their shifts before the
 policies that reference them, then verify current coverage — a policy imported
-ahead of its schedules looks perfectly correct and pages no one.
+ahead of its schedules looks perfectly correct and pages no one. This is a feature
+that allows for chaining multiple schedules in complexer on-call scenarios.
 
 **Repeat behaviour lives on the policy, and only the count survives.** Opsgenie
 repeats from the escalation object; ilert uses `repeating` and `frequency` on the
@@ -219,25 +295,29 @@ wait folded into a rule timeout, or it repeats sooner than it used to.
 
 Check also for `repeat.resetRecipientStates`, which clears acknowledgement on
 every pass and so keeps paging people who had already acked. ilert has no
-equivalent — `ACCEPTED` stops escalation — so that behaviour has to be rebuilt
-elsewhere or dropped as a deliberate decision rather than lost in translation.
+equivalent — `ACCEPTED` stops escalation.
 
 ## Order of migration
 
-1. Users — with their `Role`; collapse Opsgenie custom roles onto the fixed enum
-   first, since there is nowhere to put the leftover rights
+1. Users — with their `Role` (in theory custom RBAC roles first, if needed and in Enterprise plan)
 2. Contacts and notification preferences (per user)
 3. Teams, then team members with their `TeamRole`
 4. Schedules — including shifts/rotations, so coverage exists, plus any overrides
    standing in for forwarding rules
 5. Escalation Policies
-6. Alert Sources (one per flattened routing path)
-7. Connectors, then Alert Actions
-8. Services, then Status Pages
-9. Maintenance Windows, Event Flows, Heartbeat Monitors
-10. Call Flows — they route to the schedules and policies above
+6. Alert Sources — one per distinct set of *source-level* settings, not one per
+   routing branch
+7. Support Hours — Event Flow `SUPPORT_HOURS` nodes and `alertPriorityRule` both
+   reference them
+8. Event Flows — they route to the alert sources and escalation policies above,
+   so they come after both; this is where the flattened routing rules land, and
+   the emitters you re-point should get the **flow's** URL where a flow exists
+9. Connectors, then Alert Actions
+10. Services, then Status Pages
+11. Maintenance Windows, Heartbeat Monitors
+12. Call Flows — they route to the schedules and policies above
 
-Keep an external map of Opsgenie ID → ilert ID. No ilert *configuration* object —
+IMPORTANT: Keep an external map of Opsgenie ID → ilert ID. No ilert *configuration* object —
 alert source, escalation policy, schedule, team, user — carries an origin or
 external-ID field, and every later step needs the mapping. (Alerts themselves
 have `labels` and `customDetails`, but those are per-alert and do not help you
@@ -246,14 +326,64 @@ reconcile configuration.)
 ## The actual cutover risk
 
 Integration keys and URLs are regenerated. Every monitor, script and webhook
-sender that posts to Opsgenie must be re-pointed at the new ilert alert source
-URL. That work is external to both APIs and is where alerts get lost. Enumerate
+sender that posts to Opsgenie must be re-pointed at the new ilert URL — the
+**Event Flow's** `integrationUrl` where a flow handles that traffic, the alert
+source's where it does not. Decide which before you start re-pointing: switching
+a sender from a source URL to a flow URL later is a second round of the same
+external work. That work is external to both APIs and is where alerts get lost. Enumerate
 emitters before touching either system and run both in parallel until each
-emitter is confirmed. ilert ships an Opsgenie inbound integration for exactly
+emitter is confirmed.
+
+IMPORTANT: ilert ships an Opsgenie inbound integration for exactly
 this window: pointing it at a temporary alert source forwards Opsgenie alerts
 into ilert, so the parallel period does not require re-pointing every emitter on
 day one.
 
+**The payload changes, not just the URL.** Anything posting to Opsgenie's Alert
+API has to be rewritten, not merely redirected — and the biggest difference is
+structural. Opsgenie acknowledges and closes through *separate endpoints*
+(`POST /v2/alerts/{id}/acknowledge`, `/close`); ilert does all of it through one
+endpoint, `POST /api/events`, with `eventType` selecting the action:
+
+| Opsgenie Alert API | ilert Event |
+| --- | --- |
+| `POST /v2/alerts` | `eventType: ALERT` |
+| `POST /v2/alerts/{id}/acknowledge` | `eventType: ACCEPT` |
+| `POST /v2/alerts/{id}/close` | `eventType: RESOLVE` |
+| API key in the header | `integrationKey` in the body |
+| `alias` | `alertKey` — but how many alerts you get still depends on `alertCreation` |
+| `message` | `summary` (required on both) |
+| `description` | `details` |
+| `details` (key/value map) | `customDetails` |
+| `tags` | `labels` |
+| `priority` (`P1`–`P5`) | `severity` (integer `1`–`5`), and/or `priority` (`HIGH`/`LOW`) |
+| *(no equivalent)* | `routingKey`, `services` |
+
+Two traps in that table. `details` means different things on the two sides —
+Opsgenie's `details` is the structured key/value map (ilert's `customDetails`),
+while ilert's `details` is free text (Opsgenie's `description`); a straight
+name-for-name copy swaps them. And a script that closed an alert by calling a
+`/close` URL now has to send a `RESOLVE` event carrying the same `alertKey`,
+which means it needs to *know* that key — scripts that relied on Opsgenie's alert
+id have to be re-based on the alias.
+
+> ilert does offer a synchronous /api/alerts/{id} API as well that has verb endpoints for PUT interactions like accept or resolve
+however, for monitoring tool relevant traffic the asynchronous event API should be preferred
+
+**Deployment events are a capability you gain.** Opsgenie has no equivalent, so
+nothing migrates, but ilert's **Deployment Events** (`POST /deployment-events`,
+fed by a **Deployment Pipeline** that mints its own `integrationKey` and carries
+its own `integrationType`) correlate deploys with alerts. Teams arriving from
+Opsgenie routinely miss this because they are translating rather than shopping.
+Worth a look once the alerting path is stable. Also worth looking at all the other
+additional features that the ilert platform brings to the table, after successfull completion of the Opsgenie migration.
+
 Heartbeats deserve separate attention: an Opsgenie heartbeat that stops being
 pinged raises an alert, so a half-migrated heartbeat is silent in the new system
 and noisy in the old one. Migrate heartbeat monitors and their senders together.
+
+## A word on IaC
+
+A migration might be the right choice to introduce IaC along the way for most resources.
+If that is a desired choice ilert offers an official Terraform provider https://registry.terraform.io/providers/iLert/ilert/
+To which the same rules mentioned in this file may be applied.
