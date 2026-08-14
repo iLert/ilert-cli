@@ -2,6 +2,11 @@
   "version": 1,
   "skills": [
     {
+      "name": "ilert-essentials",
+      "description": "How ilert and the ilert CLI actually behave — the rules that are not in --help or the field names",
+      "path": "ilert-essentials/SKILL.md"
+    },
+    {
       "name": "migrate-from-opsgenie",
       "description": "Map Opsgenie resources onto ilert equivalents",
       "path": "migrate-from-opsgenie/SKILL.md"

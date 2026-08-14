@@ -12,6 +12,9 @@ the danger. What breaks is not the objects; it is **who gets told, and when**.
 The subscriber list does move — ilert has a dedicated import path that preserves
 existing consent — but only if you use it deliberately.
 
+For ilert's own semantics and the CLI behaviour behind a bulk import, read the
+`ilert-essentials` skill alongside this one.
+
 ## Status and communication are two separate objects
 
 In Statuspage, a component status change is itself a customer-facing event. It

@@ -10,6 +10,9 @@ The two products use overlapping words for different objects. Two of those
 collisions cause most migration defects, and neither is visible from the API
 spec.
 
+For ilert's own semantics and the CLI behaviour behind a bulk import, read the
+`ilert-essentials` skill alongside this one.
+
 ## The two traps
 
 **A PagerDuty Service is not an ilert Service.**
