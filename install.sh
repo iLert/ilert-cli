@@ -33,21 +33,28 @@ if [ -z "$VERSION" ]; then
 fi
 echo "Installing ilert-cli version ${VERSION}"
 
-# Prompt user to run a command with sudo; show exact command first
+# Prompt user to run a command with sudo; show exact command first.
+#
+# Takes the command as separate arguments and runs it directly. It used to take
+# one string and `eval` it, which meant a quote or a `;` anywhere in a path we
+# derived from the environment (TMPDIR, HOME) became a command run as root.
 run_with_sudo_prompt() {
-  local cmd="$1"
-  local reason="$2"
+  local reason="$1"
+  shift
   echo ""
   if [ -n "$reason" ]; then
     echo "$reason"
   fi
   echo "This usually needs administrator privileges."
   echo "The installer can continue by running:"
-  echo "  sudo $cmd"
+  # %q so what is shown is what will run, even for an awkward path.
+  printf '  sudo'
+  printf ' %q' "$@"
+  printf '\n'
   read -r -p "Run with sudo? [y/N] " answer </dev/tty
   case "$answer" in
     [yY]|[yY][eE][sS])
-      eval "sudo $cmd"
+      sudo "$@"
       ;;
     *)
       echo "Aborted."
@@ -61,18 +68,23 @@ install_binary() {
   local tmp_file="$1"
   local install_uri="$2"
 
-  # Try to move without sudo
-  if mv "$tmp_file" "$install_uri" 2>/dev/null; then
+  # Try to move without sudo. `--` throughout, so a path that starts with a
+  # dash is a path and not an option.
+  if mv -- "$tmp_file" "$install_uri" 2>/dev/null; then
     :
   else
-    run_with_sudo_prompt "mv '$tmp_file' '$install_uri'" "Cannot write to '$install_uri' with current user permissions."
+    run_with_sudo_prompt "Cannot write to '$install_uri' with current user permissions." \
+      mv -- "$tmp_file" "$install_uri"
   fi
 
-  # Try to chmod without sudo
-  if chmod 755 "$install_uri" 2>/dev/null; then
+  # Try to chmod without sudo. `--` goes before the mode, not after it: BSD
+  # chmod takes the first operand as the mode and would read a trailing `--` as
+  # a second file to change ("chmod: --: No such file or directory").
+  if chmod -- 755 "$install_uri" 2>/dev/null; then
     :
   else
-    run_with_sudo_prompt "chmod 755 '$install_uri'" "Cannot update executable permissions for '$install_uri' with current user permissions."
+    run_with_sudo_prompt "Cannot update executable permissions for '$install_uri' with current user permissions." \
+      chmod -- 755 "$install_uri"
   fi
 }
 

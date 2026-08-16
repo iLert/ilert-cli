@@ -18,6 +18,13 @@ pub enum CliError {
     #[error("Not authenticated. Run `ilert auth login` first.")]
     NotAuthenticated,
 
+    /// The profile's stored credential belongs to a different environment than
+    /// the one this invocation is pointed at. A distinct variant because a
+    /// command that merely *accepts* authentication should carry on without it
+    /// rather than fail — see `ResolvedConfig::resolve_credential_opt`.
+    #[error("{message}")]
+    CredentialEndpointMismatch { message: String },
+
     /// A destructive command was refused because nothing could confirm it.
     /// Carries the structured envelope from `crate::preview`, which the error
     /// path prints verbatim instead of the usual human-readable message.

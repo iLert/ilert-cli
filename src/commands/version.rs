@@ -154,7 +154,7 @@ async fn try_check_api() -> Result<()> {
 
     // Resolve base_url from config
     let config_manager = ConfigManager::load()?;
-    let resolved = config_manager.resolve(None, None, None, None);
+    let resolved = config_manager.resolve(None, None, None, None, None);
     let spec_url = format!(
         "{}/api-docs/openapi.json",
         resolved.base_url.trim_end_matches('/')

@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use anyhow::Result;
 use colored::Colorize;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde_json::Value;
 
 use crate::errors::CliError;
@@ -80,7 +80,12 @@ pub fn prompt_for_body(schema: &Value, resource_name: &str, action: &str) -> Res
                     .collect::<Vec<_>>()
             });
 
-        let value = if let Some(ref options) = enum_values {
+        let value = if is_secret_field(field_name, field_schema) {
+            // Asked for with the echo off whatever the schema calls it: a
+            // credential typed in the clear stays in the scrollback, and on a
+            // shared screen it never needed to be there at all.
+            prompt_secret(field_name, description, is_required)?
+        } else if let Some(ref options) = enum_values {
             prompt_enum(field_name, description, options, is_required)?
         } else {
             match field_type {
@@ -100,9 +105,12 @@ pub fn prompt_for_body(schema: &Value, resource_name: &str, action: &str) -> Res
         return Ok(None);
     }
 
-    // Confirm before sending
+    // Confirm before sending. The same redaction the `--dry-run` envelope uses:
+    // there is no point taking the value in hidden if the confirmation step
+    // prints it back out.
     eprintln!();
-    let preview = serde_json::to_string_pretty(&Value::Object(body.clone()))?;
+    let preview =
+        serde_json::to_string_pretty(&crate::preview::redact_body(&Value::Object(body.clone())))?;
     eprintln!("{}", "  Request body:".bold());
     for line in preview.lines() {
         eprintln!("    {}", line.dimmed());
@@ -119,6 +127,34 @@ pub fn prompt_for_body(schema: &Value, resource_name: &str, action: &str) -> Res
     }
 
     Ok(Some(Value::Object(body)))
+}
+
+/// Whether this field holds a credential, by the name the API gave it or by the
+/// schema saying so outright.
+///
+/// The name test is [`crate::preview::is_sensitive_body_key`], so the prompt and
+/// the preview cannot disagree about which fields are secret — a field hidden on
+/// the way in but printed on the way out would be worse than either.
+fn is_secret_field(name: &str, schema: &Value) -> bool {
+    if crate::preview::is_sensitive_body_key(name) {
+        return true;
+    }
+    schema.get("format").and_then(|f| f.as_str()) == Some("password")
+}
+
+fn prompt_secret(name: &str, description: &str, required: bool) -> Result<Option<Value>> {
+    let label = field_label(name, description, required);
+
+    let input = Password::new()
+        .with_prompt(label)
+        .allow_empty_password(!required)
+        .interact()?;
+
+    if input.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::String(input)))
+    }
 }
 
 fn prompt_string(name: &str, description: &str, required: bool) -> Result<Option<Value>> {
@@ -275,4 +311,53 @@ fn resolve_schema(schema: &Value) -> &Value {
         }
     }
     schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schema() -> Value {
+        json!({ "type": "string" })
+    }
+
+    #[test]
+    fn credential_fields_are_taken_with_the_echo_off() {
+        for name in [
+            "password",
+            "apiKey",
+            "api_key",
+            "integrationKey",
+            "routingKey",
+            "webhookSecret",
+            "refreshToken",
+        ] {
+            assert!(is_secret_field(name, &schema()), "{name} was echoed");
+        }
+    }
+
+    #[test]
+    fn a_schema_may_say_so_itself() {
+        // Nothing in the name suggests it; the schema does.
+        assert!(is_secret_field(
+            "value",
+            &json!({ "type": "string", "format": "password" })
+        ));
+    }
+
+    #[test]
+    fn ordinary_fields_stay_visible() {
+        for name in ["summary", "name", "email", "keyRotationDays"] {
+            assert!(!is_secret_field(name, &schema()), "{name} was hidden");
+        }
+    }
+
+    #[test]
+    fn the_confirmation_preview_redacts_what_the_prompt_hid() {
+        let body = json!({ "name": "webhook", "apiKey": "il1api-secret" });
+        let rendered = serde_json::to_string(&crate::preview::redact_body(&body)).unwrap();
+        assert!(!rendered.contains("il1api-secret"), "{rendered}");
+        assert!(rendered.contains("webhook"), "{rendered}");
+    }
 }

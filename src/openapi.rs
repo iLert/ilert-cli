@@ -10,7 +10,10 @@ use crate::config::ConfigManager;
 use crate::errors::CliError;
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const CACHE_FILE: &str = "openapi.json";
+
+/// The single cache file used before specs were kept per environment. Removed
+/// opportunistically on the next write so an upgrade does not strand it.
+const LEGACY_CACHE_FILE: &str = "openapi.json";
 
 #[derive(Debug, Clone)]
 pub struct Operation {
@@ -72,8 +75,8 @@ impl OperationIndex {
 
 /// Load index from cache synchronously. Returns None if no cache exists.
 /// Used at startup to build the dynamic command tree without network access.
-pub fn load_cached_index() -> Result<Option<OperationIndex>> {
-    let cache_path = cache_file_path()?;
+pub fn load_cached_index(base_url: &str) -> Result<Option<OperationIndex>> {
+    let cache_path = cache_file_path(base_url)?;
     match load_from_cache(&cache_path)? {
         Some(spec) => Ok(Some(build_index(&spec)?)),
         None => Ok(None),
@@ -82,7 +85,7 @@ pub fn load_cached_index() -> Result<Option<OperationIndex>> {
 
 /// Ensure we have a fresh spec. Fetches if missing or stale, returns the index.
 pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
-    let cache_path = cache_file_path()?;
+    let cache_path = cache_file_path(base_url)?;
     let spec_url = format!("{}/api-docs/openapi.json", base_url.trim_end_matches('/'));
 
     // Try cache first
@@ -115,9 +118,50 @@ async fn fetch_spec(url: &str) -> Result<Value> {
     Ok(spec)
 }
 
-fn cache_file_path() -> Result<PathBuf> {
+/// Where the spec served by `base_url` is cached.
+///
+/// One file per environment. The cached spec decides which commands exist and
+/// what they classify as, so serving a staging spec to a production profile
+/// (or the reverse) just because it was fetched more recently would be wrong in
+/// a way that is invisible at the call site.
+fn cache_file_path(base_url: &str) -> Result<PathBuf> {
     let cache_dir = ConfigManager::cache_dir()?;
-    Ok(cache_dir.join(CACHE_FILE))
+    Ok(cache_dir.join(format!("openapi-{}.json", cache_key(base_url))))
+}
+
+/// A filesystem-safe, stable name for an environment: a readable slug of the
+/// host so the cache directory can be understood at a glance, plus a digest so
+/// two URLs that slugify the same never share a file.
+fn cache_key(base_url: &str) -> String {
+    let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
+    let bare = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or(&normalized);
+    let slug: String = bare
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    format!("{slug}-{:08x}", fnv1a(&normalized))
+}
+
+/// FNV-1a, hand-rolled: the standard library's hasher makes no promise of
+/// stability across releases, and a cache filename that changes with the
+/// toolchain would silently orphan every spec already on disk.
+fn fnv1a(value: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn load_from_cache(path: &PathBuf) -> Result<Option<Value>> {
@@ -141,6 +185,10 @@ fn is_cache_stale(path: &PathBuf) -> Result<bool> {
 fn save_to_cache(path: &PathBuf, spec: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Nothing reads the pre-per-environment file any more; drop it rather
+        // than leave a megabyte of unreachable spec behind. Best effort — a
+        // failure here has no bearing on the write that matters.
+        let _ = std::fs::remove_file(parent.join(LEGACY_CACHE_FILE));
     }
     let content = serde_json::to_string(spec)?;
     std::fs::write(path, content)?;
@@ -437,4 +485,46 @@ fn follow_ref<'a>(ref_path: &str, spec: &'a Value) -> Option<&'a Value> {
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_key;
+
+    #[test]
+    fn environments_get_separate_cache_keys() {
+        assert_ne!(
+            cache_key("https://api.ilert.com"),
+            cache_key("https://api.ilert.dev")
+        );
+    }
+
+    #[test]
+    fn cache_key_ignores_trailing_slash_and_case() {
+        let canonical = cache_key("https://api.ilert.com");
+        assert_eq!(cache_key("https://api.ilert.com/"), canonical);
+        assert_eq!(cache_key("https://API.ilert.com"), canonical);
+    }
+
+    #[test]
+    fn cache_key_is_a_safe_file_name() {
+        let key = cache_key("http://localhost:8080/gateway");
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'),
+            "unsafe cache key: {key}"
+        );
+        assert!(key.starts_with("localhost_8080_gateway-"), "got: {key}");
+    }
+
+    #[test]
+    fn long_urls_stay_distinct_after_truncation() {
+        // The readable slug is capped, so only the digest separates URLs that
+        // share a long prefix.
+        let prefix = "https://very-long-host-name-that-exceeds-the-slug-budget.example.com";
+        assert_ne!(
+            cache_key(&format!("{prefix}/alpha")),
+            cache_key(&format!("{prefix}/beta"))
+        );
+    }
 }

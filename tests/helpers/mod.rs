@@ -64,9 +64,24 @@ impl TestHarness {
     /// Create a Command pre-configured with --base-url pointing at the mock server
     /// and environment variables for isolated config/cache directories.
     pub fn cmd(&self) -> Command {
+        self.cmd_for(&self.server.uri())
+    }
+
+    /// The same isolated config and cache directories, pointed at a different
+    /// endpoint — for checking that per-environment state really is separated
+    /// rather than shared by whichever profile ran last.
+    pub fn cmd_for(&self, base_url: &str) -> Command {
+        let mut cmd = self.bare_cmd();
+        cmd.args(["--base-url", base_url]);
+        cmd
+    }
+
+    /// The isolated environment with no endpoint on the command line at all —
+    /// for tests about what the *environment* resolves to, where a `--base-url`
+    /// override would be the very thing under test.
+    pub fn bare_cmd(&self) -> Command {
         let mut cmd = Command::cargo_bin("ilert").expect("binary not found");
-        cmd.args(["--base-url", &self.server.uri()])
-            .env("XDG_CONFIG_HOME", self.config_dir.path())
+        cmd.env("XDG_CONFIG_HOME", self.config_dir.path())
             .env("XDG_CACHE_HOME", self.cache_dir.path())
             // Use a file-backed secret store so tests stay isolated and never
             // touch (or prompt for) the real OS keyring.
@@ -82,7 +97,18 @@ impl TestHarness {
     }
 
     /// Seed the secret store with a single credential for the given profile.
+    ///
+    /// Credentials are bound to the environment that issued them, so one seeded
+    /// without an explicit `base_url` is bound to this harness's server — the
+    /// endpoint every `cmd()` talks to. Pass `"base_url": null` to seed a
+    /// credential from before binding existed.
     pub fn seed_secret(&self, profile: &str, credential_json: serde_json::Value) {
+        let mut credential_json = credential_json;
+        if let Some(object) = credential_json.as_object_mut()
+            && !object.contains_key("base_url")
+        {
+            object.insert("base_url".into(), serde_json::json!(self.server.uri()));
+        }
         let map = serde_json::json!({ profile: credential_json });
         std::fs::write(
             self.secret_file(),
@@ -128,21 +154,21 @@ impl TestHarness {
             .expect("failed to seed cache");
     }
 
-    /// Verify the spec endpoint was called at least once.
-    pub async fn verify_spec_fetched(&self) {
-        let requests = self
-            .server
+    /// How many times this server has been asked for the OpenAPI spec.
+    pub async fn spec_request_count(&self) -> usize {
+        self.server
             .received_requests()
             .await
-            .expect("no requests recorded");
-
-        let spec_requests = requests
+            .expect("no requests recorded")
             .iter()
             .filter(|r| r.url.path() == "/api-docs/openapi.json")
-            .count();
+            .count()
+    }
 
+    /// Verify the spec endpoint was called at least once.
+    pub async fn verify_spec_fetched(&self) {
         assert!(
-            spec_requests > 0,
+            self.spec_request_count().await > 0,
             "Expected spec to be fetched, but it was not"
         );
     }

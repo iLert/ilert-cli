@@ -28,11 +28,21 @@ const SERVICE: &str = "ilert";
 const REFRESH_LEEWAY_SECS: i64 = 60;
 
 /// A stored credential — either a raw API key or a set of OAuth2 tokens.
+///
+/// Every credential carries the environment it was issued for. A token minted by
+/// one ilert instance is worthless to another and must never be offered to it, so
+/// the binding travels with the secret rather than with the profile settings that
+/// a flag or an environment variable can override — see
+/// [`crate::config::ResolvedConfig::ensure_credential_matches_endpoint`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Credential {
     #[serde(rename = "api_key")]
-    ApiKey { key: String },
+    ApiKey {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+    },
     #[serde(rename = "oauth")]
     OAuth {
         access_token: String,
@@ -42,6 +52,8 @@ pub enum Credential {
         token_type: String,
         #[serde(default)]
         scopes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
     },
 }
 
@@ -49,8 +61,20 @@ impl Credential {
     /// The value to send in the `Authorization: Bearer` header.
     pub fn bearer_value(&self) -> &str {
         match self {
-            Credential::ApiKey { key } => key,
+            Credential::ApiKey { key, .. } => key,
             Credential::OAuth { access_token, .. } => access_token,
+        }
+    }
+
+    /// The normalized base URL this credential was issued for.
+    ///
+    /// `None` only for credentials written before the binding existed; callers
+    /// resolve those against the profile instead of trusting the request.
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Credential::ApiKey { base_url, .. } | Credential::OAuth { base_url, .. } => {
+                base_url.as_deref()
+            }
         }
     }
 
@@ -62,6 +86,17 @@ impl Credential {
                 *expires_at - Utc::now() < Duration::seconds(REFRESH_LEEWAY_SECS)
             }
             Credential::ApiKey { .. } => false,
+        }
+    }
+
+    /// Record the environment this credential belongs to. Called on every write,
+    /// so a credential refreshed by a newer binary picks up a binding it was
+    /// stored without.
+    pub fn bind_to(&mut self, endpoint: &str) {
+        match self {
+            Credential::ApiKey { base_url, .. } | Credential::OAuth { base_url, .. } => {
+                *base_url = Some(endpoint.to_string());
+            }
         }
     }
 

@@ -20,6 +20,11 @@
       "name": "migrate-from-statuspageio",
       "description": "Map Statuspageio (Atlassian Statuspage) resources onto ilert status page equivalents",
       "path": "migrate-from-statuspageio/SKILL.md"
+    },
+    {
+      "name": "setup-environment-profile",
+      "description": "Point the ilert CLI at a non-production ilert environment by giving it its own profile",
+      "path": "setup-environment-profile/SKILL.md"
     }
   ]
 }

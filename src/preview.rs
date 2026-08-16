@@ -67,7 +67,12 @@ fn normalize_key(key: &str) -> String {
         .collect()
 }
 
-fn is_sensitive_body_key(key: &str) -> bool {
+/// Whether a body field holds something that must not be shown.
+///
+/// Public because redaction is not only about printing: the interactive prompt
+/// asks for these fields with the echo off, and it has to agree with the
+/// preview about which ones they are.
+pub fn is_sensitive_body_key(key: &str) -> bool {
     let normalized = normalize_key(key);
     SENSITIVE_BODY_KEY_PARTS
         .iter()

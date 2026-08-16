@@ -58,6 +58,7 @@ an endpoint directly.
 | `--dry-run` | print the request, send nothing |
 | `-y` | skip confirmation prompts |
 | `--profile NAME` | switch config profile |
+| `--base-url URL` | point at another ilert environment (on `auth login`) |
 
 ## Agents
 

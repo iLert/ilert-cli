@@ -2687,6 +2687,69 @@ async fn heartbeat_allows_a_loopback_beat_url() {
         .success();
 }
 
+#[tokio::test]
+async fn a_failed_heartbeat_ping_does_not_name_the_key() {
+    let h = TestHarness::start().await;
+
+    // Port 9 (discard) with nothing listening: a plain transport failure, the
+    // shape a flaky network produces in CI every day. reqwest's own message
+    // would quote the whole URL, and the key is the last segment of it.
+    h.cmd()
+        .args([
+            "heartbeat",
+            "ping",
+            "customer-heartbeat-secret",
+            "--beat-url",
+            "http://127.0.0.1:9",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Heartbeat ping to 127.0.0.1 failed",
+        ))
+        .stderr(predicate::str::contains("customer-heartbeat-secret").not());
+}
+
+#[tokio::test]
+async fn a_heartbeat_redirect_is_not_followed() {
+    let h = TestHarness::start().await;
+    let sink = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/pings/customer-heartbeat-secret"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("{}/api/pings/customer-heartbeat-secret", sink.base_url()).as_str(),
+        ))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args([
+            "heartbeat",
+            "ping",
+            "customer-heartbeat-secret",
+            "--beat-url",
+            &format!("{}/api/pings", h.base_url()),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("redirect"));
+
+    // The key is in the path, so following the redirect would have handed it to
+    // a host that only had to answer with a Location header to get it.
+    let followed = sink
+        .server()
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    assert!(
+        followed.is_empty(),
+        "the ping was replayed at the redirect target: {:?}",
+        followed.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The reviewed writes are gated
 // ---------------------------------------------------------------------------
@@ -2856,4 +2919,556 @@ async fn login_rewrites_a_config_file_that_carried_a_plaintext_key() {
         "config.json still carries a credential: {written}"
     );
     assert_eq!(written["profiles"]["default"]["team_context"], "ops");
+}
+
+// ---------------------------------------------------------------------------
+// Non-production environments
+// ---------------------------------------------------------------------------
+
+/// The token response every OAuth exchange in this section replies with.
+fn oauth_tokens() -> serde_json::Value {
+    json!({
+        "token_type": "Bearer",
+        "access_token": "env-access-token",
+        "expires_in": 3600,
+        "scope": "wildcard:d offline_access",
+        "refresh_token": "env-refresh-token",
+        "refresh_token_expires_in": 31536000
+    })
+}
+
+#[tokio::test]
+async fn login_authorizes_as_the_configured_oauth_application() {
+    let h = TestHarness::start().await;
+
+    // The exchange only matches when the CLI sent the id it was given — a
+    // production id against another environment is rejected by the real IDP.
+    Mock::given(method("POST"))
+        .and(path("/api/developers/oauth2/token"))
+        .and(body_string_contains("client_id=other-env-client-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(oauth_tokens()))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .env("ILERT_OAUTH_TEST_CODE", "test-auth-code")
+        .args(["auth", "login", "--oauth-client-id", "other-env-client-id"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("via OAuth"));
+
+    // Persisted next to the base URL, so later commands on this profile keep
+    // reaching the same environment without repeating either flag.
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.config_file()).expect("config written"))
+            .expect("config is valid JSON");
+    assert_eq!(
+        written["profiles"]["default"]["oauth_client_id"],
+        "other-env-client-id"
+    );
+}
+
+#[tokio::test]
+async fn login_against_production_does_not_pin_the_client_id() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/developers/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(oauth_tokens()))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .env("ILERT_OAUTH_TEST_CODE", "test-auth-code")
+        .args(["auth", "login"])
+        .assert()
+        .success();
+
+    // Writing the default would freeze today's value into config.json and
+    // survive a rotation that ships with the binary.
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.config_file()).expect("config written"))
+            .expect("config is valid JSON");
+    assert!(
+        written["profiles"]["default"]
+            .get("oauth_client_id")
+            .is_none(),
+        "default client id was pinned into config.json: {written}"
+    );
+}
+
+#[tokio::test]
+async fn a_silent_refresh_uses_the_profile_oauth_application() {
+    let h = TestHarness::start().await;
+
+    // A profile set up against another environment, with an expired token.
+    h.write_config(json!({
+        "default_profile": "default",
+        "profiles": { "default": { "oauth_client_id": "other-env-client-id" } }
+    }));
+    h.seed_secret(
+        "default",
+        json!({
+            "type": "oauth",
+            "access_token": "stale-access-token",
+            "refresh_token": "old-refresh-token",
+            "expires_at": "2000-01-01T00:00:00Z",
+            "token_type": "Bearer",
+            "scopes": ["wildcard:d"]
+        }),
+    );
+
+    // Refresh runs on ordinary commands, so it has to carry the same id the
+    // login used — otherwise the session dies at the access token's TTL.
+    Mock::given(method("POST"))
+        .and(path("/api/developers/oauth2/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("client_id=other-env-client-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(oauth_tokens()))
+        .mount(h.server())
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .and(bearer_token("env-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9,
+            "username": "otherenvuser"
+        })))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args(["auth", "whoami"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("otherenvuser"));
+}
+
+#[tokio::test]
+async fn the_spec_cache_is_kept_per_environment() {
+    let h = TestHarness::start().await;
+    h.seed_cache().await;
+    let fetched_before = h.spec_request_count().await;
+    assert_eq!(fetched_before, 1, "expected exactly one spec fetch to seed");
+
+    // A second environment sharing the same cache directory, serving a spec
+    // with entirely different operations in it.
+    let other = wiremock::MockServer::start().await;
+    let other_spec: serde_json::Value =
+        serde_json::from_str(helpers::CLASSIFICATION_SPEC).expect("fixture is valid JSON");
+    Mock::given(method("GET"))
+        .and(path("/api-docs/openapi.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(other_spec))
+        .mount(&other)
+        .await;
+
+    // The other environment must fetch its own spec rather than inherit the
+    // one already on disk — the spec decides which commands exist at all.
+    h.cmd_for(&other.uri())
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rekeyVault"));
+
+    // ...and doing so must not evict the first environment's spec.
+    h.cmd()
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rekeyVault").not());
+    assert_eq!(
+        h.spec_request_count().await,
+        fetched_before,
+        "the production spec was re-fetched after a command against another environment"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Credentials are bound to the environment that issued them
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_overridden_endpoint_cannot_borrow_stored_credentials() {
+    let h = TestHarness::start().await;
+    h.cmd()
+        .args(["auth", "login", "--api-key", "production-key"])
+        .assert()
+        .success();
+
+    // Somewhere else entirely — an endpoint this profile never logged in to.
+    let elsewhere = wiremock::MockServer::start().await;
+
+    h.cmd_for(&elsewhere.uri())
+        .args(["auth", "whoami"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Refusing to send profile 'default'",
+        ))
+        .stderr(predicate::str::contains("--profile"));
+
+    // The point of the refusal: the key never reached the other host. Not even
+    // the spec fetch, which would have gone out before the credential.
+    let leaked = elsewhere
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    assert!(
+        leaked.is_empty(),
+        "credentials were offered to an unrelated endpoint: {:?}",
+        leaked.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_api_key_may_target_any_endpoint() {
+    let h = TestHarness::start().await;
+    h.cmd()
+        .args(["auth", "login", "--api-key", "production-key"])
+        .assert()
+        .success();
+
+    // A key passed per invocation is the caller's to place: it is never stored,
+    // and it is not the profile's credential being redirected.
+    let elsewhere = TestHarness::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .and(bearer_token("throwaway-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 3,
+            "username": "elsewhereuser"
+        })))
+        .mount(elsewhere.server())
+        .await;
+
+    h.cmd_for(&elsewhere.base_url())
+        .args(["auth", "whoami", "--api-key", "throwaway-key"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("elsewhereuser"));
+}
+
+#[tokio::test]
+async fn a_credential_from_before_binding_is_placed_by_its_profile() {
+    let h = TestHarness::start().await;
+    // Written by an older binary: no endpoint recorded on the credential, only
+    // the profile that was in use at the time.
+    h.write_config(json!({
+        "default_profile": "default",
+        "profiles": { "default": { "base_url": h.base_url() } }
+    }));
+    h.seed_secret(
+        "default",
+        json!({ "type": "api_key", "key": "legacy-key", "base_url": null }),
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .and(bearer_token("legacy-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 4,
+            "username": "legacyuser"
+        })))
+        .mount(h.server())
+        .await;
+
+    // Still works against the environment it belongs to...
+    h.cmd()
+        .args(["auth", "whoami"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("legacyuser"));
+
+    // ...and is still refused everywhere else.
+    let elsewhere = wiremock::MockServer::start().await;
+    h.cmd_for(&elsewhere.uri())
+        .args(["auth", "whoami"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Refusing to send profile"));
+}
+
+#[tokio::test]
+async fn logout_revokes_at_the_issuing_endpoint() {
+    let h = TestHarness::start().await;
+    h.seed_secret(
+        "default",
+        json!({
+            "type": "oauth",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "token_type": "Bearer",
+            "scopes": ["wildcard:d"]
+        }),
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/developers/oauth2/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(h.server())
+        .await;
+
+    // Logging out while pointed somewhere else must not hand the refresh token
+    // to that endpoint — revocation is only meaningful at the issuer.
+    let elsewhere = wiremock::MockServer::start().await;
+    h.cmd_for(&elsewhere.uri())
+        .args(["auth", "logout"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Logged out"));
+
+    let stray = elsewhere
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    assert!(
+        stray.is_empty(),
+        "the refresh token was sent to an endpoint that never issued it: {:?}",
+        stray.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+
+    let revocations = h
+        .server()
+        .received_requests()
+        .await
+        .expect("no requests recorded")
+        .iter()
+        .filter(|r| r.url.path() == "/api/developers/oauth2/revoke")
+        .count();
+    assert_eq!(revocations, 1, "the issuer was not asked to revoke");
+
+    // Local removal happens either way.
+    h.cmd()
+        .args(["auth", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not set"));
+}
+
+#[tokio::test]
+async fn an_event_send_to_another_endpoint_leaves_the_profile_token_at_home() {
+    let h = TestHarness::start().await;
+    h.cmd()
+        .args(["auth", "login", "--api-key", "production-key"])
+        .assert()
+        .success();
+
+    // Event ingest authenticates with its integration key, so pointing one at
+    // another environment is legitimate — it just must not carry this profile's
+    // credential along with it.
+    let elsewhere = TestHarness::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/events"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "alertKey": "abc123" })))
+        .mount(elsewhere.server())
+        .await;
+
+    h.cmd_for(&elsewhere.base_url())
+        .args(["event", "send", "-k", "int-key", "-s", "hi"])
+        .assert()
+        .success();
+
+    let sent = elsewhere
+        .server()
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    let carried_credentials = sent.iter().any(|r| r.headers.contains_key("authorization"));
+    assert!(
+        !carried_credentials,
+        "an event send to another environment carried the profile's credential"
+    );
+}
+
+#[tokio::test]
+async fn an_inherited_api_key_stays_with_the_environment_that_exported_it() {
+    let h = TestHarness::start().await;
+    let elsewhere = TestHarness::start().await;
+
+    // The CI shape: a key and an endpoint exported together, no stored
+    // credential at all. Whoever exported the key never saw this command line.
+    h.cmd_for(&elsewhere.base_url())
+        .env("ILERT_API_KEY", "production-key")
+        .env("ILERT_BASE_URL", h.base_url())
+        .args(["auth", "whoami"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Refusing to send the API key from ILERT_API_KEY",
+        ))
+        .stderr(predicate::str::contains("--api-key"));
+
+    let leaked = elsewhere
+        .server()
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    assert!(
+        leaked.is_empty(),
+        "an exported key was offered to an unrelated endpoint: {:?}",
+        leaked.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn an_inherited_api_key_works_where_its_environment_points() {
+    let h = TestHarness::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .and(bearer_token("ci-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 7,
+            "username": "ciuser"
+        })))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .env("ILERT_API_KEY", "ci-key")
+        .env("ILERT_BASE_URL", h.base_url())
+        .args(["auth", "whoami"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ciuser"));
+}
+
+#[tokio::test]
+async fn a_token_endpoint_redirect_is_not_followed() {
+    let h = TestHarness::start().await;
+    let sink = TestHarness::start().await;
+
+    // 307 preserves the method and the body, so following one would repeat the
+    // authorization code — and later the refresh token — at the new location.
+    Mock::given(method("POST"))
+        .and(path("/api/developers/oauth2/token"))
+        .respond_with(ResponseTemplate::new(307).insert_header(
+            "location",
+            format!("{}/api/developers/oauth2/token", sink.base_url()).as_str(),
+        ))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .env("ILERT_OAUTH_TEST_CODE", "test-auth-code")
+        .args(["auth", "login"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("redirect"));
+
+    let followed = sink
+        .server()
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    assert!(
+        followed.is_empty(),
+        "the token request was replayed at the redirect target: {:?}",
+        followed.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn importing_one_variable_keeps_the_rest_of_the_profile() {
+    let h = TestHarness::start().await;
+    h.write_config(json!({
+        "default_profile": "other-env",
+        "profiles": {
+            "other-env": {
+                "base_url": h.base_url(),
+                "oauth_client_id": "other-env-client-id",
+                "team_context": "sre"
+            }
+        }
+    }));
+
+    // Only a key is exported. The endpoint and application this profile was set
+    // up with must survive, or its credential would stay bound to one
+    // environment while the profile quietly fell back to production.
+    h.cmd()
+        .env("ILERT_API_KEY", "rotated-key")
+        .args(["config", "import"])
+        .assert()
+        .success();
+
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.config_file()).expect("config written"))
+            .expect("config is valid JSON");
+    let profile = &written["profiles"]["other-env"];
+    assert_eq!(profile["base_url"], json!(h.base_url()));
+    assert_eq!(profile["oauth_client_id"], "other-env-client-id");
+    assert_eq!(profile["team_context"], "sre");
+
+    // And the imported key is bound to that endpoint, not to production.
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.secret_file()).expect("secret written"))
+            .expect("secret file is valid JSON");
+    assert_eq!(stored["other-env"]["base_url"], json!(h.base_url()));
+}
+
+#[tokio::test]
+async fn an_inherited_api_key_does_not_follow_a_profile_named_on_the_command_line() {
+    let h = TestHarness::start().await;
+    let elsewhere = TestHarness::start().await;
+
+    // Two profiles: the one this shell is set up for, and another environment.
+    h.write_config(json!({
+        "default_profile": "default",
+        "profiles": {
+            "default": { "base_url": h.base_url() },
+            "other-env": { "base_url": elsewhere.base_url() }
+        }
+    }));
+
+    // No `--base-url` here: the endpoint comes from the profile, and `--profile`
+    // is the command line choosing it. That must not also choose which
+    // environment the exported key counts as belonging to.
+    h.bare_cmd()
+        .env("ILERT_API_KEY", "production-key")
+        .args(["--profile", "other-env", "auth", "whoami"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Refusing to send the API key from ILERT_API_KEY",
+        ));
+
+    let leaked = elsewhere
+        .server()
+        .received_requests()
+        .await
+        .expect("no requests recorded");
+    assert!(
+        leaked.is_empty(),
+        "an exported key followed --profile to another environment: {:?}",
+        leaked.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn an_inherited_api_key_serves_the_profile_the_environment_selects() {
+    let h = TestHarness::start().await;
+    h.write_config(json!({
+        "default_profile": "default",
+        "profiles": { "other-env": { "base_url": h.base_url() } }
+    }));
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .and(bearer_token("ci-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9,
+            "username": "envuser"
+        })))
+        .mount(h.server())
+        .await;
+
+    // ILERT_PROFILE selects the profile the same way the key was selected, so
+    // the pair is consistent and the key travels.
+    h.bare_cmd()
+        .env("ILERT_API_KEY", "ci-key")
+        .env("ILERT_PROFILE", "other-env")
+        .args(["auth", "whoami"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("envuser"));
 }

@@ -18,8 +18,30 @@ use crate::config::ensure_secure_base_url;
 use crate::errors::CliError;
 use crate::secret_store::Credential;
 
-/// OAuth2 `client_id` of the ilert CLI application.
-pub const CLIENT_ID: &str = "a375a46d20f9ee0dca6b";
+/// OAuth2 `client_id` of the ilert CLI application on production.
+///
+/// Every ilert environment registers its own application, so this is a fallback
+/// rather than a constant: the id in use is resolved per profile from
+/// `--oauth-client-id`, `ILERT_OAUTH_CLIENT_ID` or `oauth_client_id` in
+/// `config.json` (see [`crate::config::ConfigManager::resolve`]). A non-production
+/// id therefore lives in the operator's own config, never in this repository.
+///
+/// The value is a public identifier, not a secret — under PKCE the code verifier
+/// is what protects the exchange.
+pub const DEFAULT_CLIENT_ID: &str = "a375a46d20f9ee0dca6b";
+
+/// Which environment an OAuth call runs against, and as which registered
+/// application.
+///
+/// The two travel together because a `client_id` is only meaningful at the
+/// endpoint it was registered with — pairing a production id with a staging
+/// base URL fails at the authorize step, and passing them as two bare `&str`
+/// makes that mistake easy to write.
+#[derive(Debug, Clone, Copy)]
+pub struct OauthConfig<'a> {
+    pub base_url: &'a str,
+    pub client_id: &'a str,
+}
 
 /// Loopback port the CLI listens on for the OAuth redirect —
 /// must match the port inside `REDIRECT_URI`.
@@ -31,7 +53,7 @@ pub const REDIRECT_URI: &str = "http://localhost:4597/callback";
 /// Space-separated OAuth scopes. `offline_access` is required to receive a
 /// refresh token under PKCE;
 ///
-/// The `:d` suffix on `wildcard` is load-bearing: ilert reads the suffix as the
+/// The `:d` suffix on `wildcard` is required: ilert reads the suffix as the
 /// permission level, and a bare scope grants read-only. `:d` is read + write +
 /// delete — the CLI needs all three, since it exposes destructive operations.
 pub const SCOPES: &str = "wildcard:d offline_access";
@@ -54,6 +76,11 @@ const CALLBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 fn http_client() -> Result<reqwest::Client> {
     crate::client::builder()
         .timeout(TOKEN_HTTP_TIMEOUT)
+        // These POSTs carry an authorization code or a refresh token in the
+        // body, and a 307/308 replays the body verbatim at the new location —
+        // so a redirect from the token endpoint is a way to hand the secret to
+        // whoever the response names. Same policy as the API client.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to build OAuth HTTP client")
 }
@@ -77,7 +104,10 @@ pub struct TokenResponse {
 impl TokenResponse {
     /// Convert a token response into a stored OAuth credential, computing
     /// `expires_at` from `expires_in` relative to now.
-    pub fn into_credential(self) -> Credential {
+    ///
+    /// `base_url` is the endpoint that issued these tokens; it is recorded so
+    /// they can never be offered to a different one.
+    pub fn into_credential(self, base_url: &str) -> Credential {
         let expires_at = Utc::now() + Duration::seconds(self.expires_in);
         let scopes = self.scope.split_whitespace().map(str::to_string).collect();
         Credential::OAuth {
@@ -86,20 +116,21 @@ impl TokenResponse {
             expires_at,
             token_type: self.token_type,
             scopes,
+            base_url: Some(crate::config::normalize_base_url(base_url)),
         }
     }
 }
 
 /// Run the interactive browser + loopback login flow and return an OAuth
 /// credential. Honors `ILERT_OAUTH_TEST_CODE` to bypass the browser in tests.
-pub async fn run_login_flow(base_url: &str, ctx: &RunContext) -> Result<Credential> {
+pub async fn run_login_flow(oauth: OauthConfig<'_>, ctx: &RunContext) -> Result<Credential> {
     // Never start an OAuth exchange against a cleartext endpoint.
-    ensure_secure_base_url(base_url)?;
+    ensure_secure_base_url(oauth.base_url)?;
 
     let verifier = gen_verifier();
     let challenge = code_challenge(&verifier);
     let state = gen_state();
-    let authorize_url = build_authorize_url(base_url, &challenge, &state)?;
+    let authorize_url = build_authorize_url(oauth, &challenge, &state)?;
 
     // Test seam: skip browser + loopback when an authorization code is injected.
     // Compiled out of release builds to keep it off the production attack surface.
@@ -108,8 +139,8 @@ pub async fn run_login_flow(base_url: &str, ctx: &RunContext) -> Result<Credenti
         if let Ok(code) = std::env::var("ILERT_OAUTH_TEST_CODE")
             && !code.is_empty()
         {
-            let token = exchange_code(base_url, &code, &verifier).await?;
-            return Ok(token.into_credential());
+            let token = exchange_code(oauth, &code, &verifier).await?;
+            return Ok(token.into_credential(oauth.base_url));
         }
     }
 
@@ -135,16 +166,16 @@ pub async fn run_login_flow(base_url: &str, ctx: &RunContext) -> Result<Credenti
         return Err(CliError::user("OAuth state mismatch — possible CSRF, aborting.").into());
     }
 
-    let token = exchange_code(base_url, &code, &verifier).await?;
-    Ok(token.into_credential())
+    let token = exchange_code(oauth, &code, &verifier).await?;
+    Ok(token.into_credential(oauth.base_url))
 }
 
 /// Refresh an access token using a refresh token (PKCE: no client secret).
-pub async fn refresh(base_url: &str, refresh_token: &str) -> Result<TokenResponse> {
+pub async fn refresh(oauth: OauthConfig<'_>, refresh_token: &str) -> Result<TokenResponse> {
     post_token(
-        base_url,
+        oauth.base_url,
         &[
-            ("client_id", CLIENT_ID),
+            ("client_id", oauth.client_id),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
         ],
@@ -168,11 +199,15 @@ pub async fn revoke(base_url: &str, refresh_token: &str) {
         .await;
 }
 
-async fn exchange_code(base_url: &str, code: &str, verifier: &str) -> Result<TokenResponse> {
+async fn exchange_code(
+    oauth: OauthConfig<'_>,
+    code: &str,
+    verifier: &str,
+) -> Result<TokenResponse> {
     post_token(
-        base_url,
+        oauth.base_url,
         &[
-            ("client_id", CLIENT_ID),
+            ("client_id", oauth.client_id),
             ("grant_type", "authorization_code"),
             ("code", code),
             ("code_verifier", verifier),
@@ -192,6 +227,15 @@ async fn post_token(base_url: &str, params: &[(&str, &str)]) -> Result<TokenResp
         .context("Token request failed")?;
 
     let status = resp.status();
+    if status.is_redirection() {
+        return Err(CliError::user(format!(
+            "The token endpoint answered with a redirect (HTTP {}), which this client will not \
+             follow — replaying the request would repeat the credential in its body at the new \
+             location. Check that the base URL names the API host itself.",
+            status.as_u16()
+        ))
+        .into());
+    }
     let text = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
@@ -222,12 +266,12 @@ fn parse_oauth_error(text: &str) -> Option<String> {
     }
 }
 
-fn build_authorize_url(base_url: &str, challenge: &str, state: &str) -> Result<String> {
-    let endpoint = format!("{}{}", base_url.trim_end_matches('/'), AUTHORIZE_PATH);
+fn build_authorize_url(oauth: OauthConfig<'_>, challenge: &str, state: &str) -> Result<String> {
+    let endpoint = format!("{}{}", oauth.base_url.trim_end_matches('/'), AUTHORIZE_PATH);
     let url = Url::parse_with_params(
         &endpoint,
         &[
-            ("client_id", CLIENT_ID),
+            ("client_id", oauth.client_id),
             ("response_type", "code"),
             ("redirect_uri", REDIRECT_URI),
             ("scope", SCOPES),
@@ -698,16 +742,40 @@ mod tests {
         assert!(SCOPES.split_whitespace().any(|s| s == "offline_access"));
     }
 
+    /// An authorize URL for an arbitrary environment, as the flow would build it.
+    fn authorize_url(base_url: &str, client_id: &str) -> Url {
+        let raw = build_authorize_url(
+            OauthConfig {
+                base_url,
+                client_id,
+            },
+            "challenge",
+            "state",
+        )
+        .unwrap();
+        Url::parse(&raw).unwrap()
+    }
+
+    fn query_param(url: &Url, key: &str) -> String {
+        url.query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_else(|| panic!("{key} param"))
+    }
+
     #[test]
     fn authorize_url_carries_suffixed_scope() {
-        let url = build_authorize_url("https://app.ilert.com", "challenge", "state").unwrap();
-        let parsed = Url::parse(&url).unwrap();
-        let scope = parsed
-            .query_pairs()
-            .find(|(k, _)| k == "scope")
-            .map(|(_, v)| v.into_owned())
-            .expect("scope param");
-        assert_eq!(scope, SCOPES);
+        let url = authorize_url("https://app.ilert.com", DEFAULT_CLIENT_ID);
+        assert_eq!(query_param(&url, "scope"), SCOPES);
+    }
+
+    #[test]
+    fn authorize_url_uses_the_configured_client_id() {
+        // A non-production environment registers its own application, so the id
+        // must come from the resolved config and not from the compiled default.
+        let url = authorize_url("https://api.example.test", "staging-client-id");
+        assert_eq!(query_param(&url, "client_id"), "staging-client-id");
+        assert!(url.as_str().starts_with("https://api.example.test/"));
     }
 
     #[test]
@@ -756,17 +824,20 @@ mod tests {
             refresh_token: Some("rt".to_string()),
             refresh_token_expires_in: Some(31536000),
         };
-        let cred = resp.into_credential();
+        let cred = resp.into_credential("https://api.example.test/");
         match cred {
             Credential::OAuth {
                 scopes,
                 token_type,
                 refresh_token,
+                base_url,
                 ..
             } => {
                 assert_eq!(scopes, vec!["wildcard", "offline_access"]);
                 assert_eq!(token_type, "Bearer");
                 assert_eq!(refresh_token.as_deref(), Some("rt"));
+                // Bound to the issuing environment, normalized.
+                assert_eq!(base_url.as_deref(), Some("https://api.example.test"));
             }
             _ => panic!("expected OAuth credential"),
         }

@@ -167,7 +167,11 @@ pub struct Cli {
 impl Cli {
     pub async fn new() -> Result<Self> {
         let config_manager = ConfigManager::load()?;
-        let cached_index = openapi::load_cached_index()?;
+        // The dynamic command tree is built from the cached spec, and which spec
+        // that is depends on the environment — so the base URL has to be known
+        // before the parser that would normally report it can be constructed.
+        let base_url = bootstrap_base_url(&config_manager);
+        let cached_index = openapi::load_cached_index(&base_url)?;
         Ok(Self {
             config_manager,
             cached_index,
@@ -215,6 +219,9 @@ impl Cli {
             matches.get_one::<String>("profile").map(String::as_str),
             matches.get_one::<String>("api-key").map(String::as_str),
             matches.get_one::<String>("base-url").map(String::as_str),
+            matches
+                .get_one::<String>("oauth-client-id")
+                .map(String::as_str),
             matches
                 .get_one::<String>("team-context")
                 .map(String::as_str),
@@ -382,29 +389,53 @@ impl Cli {
                     .map(String::as_str)
                     .unwrap_or(&config.base_url)
                     .to_string();
+                // Already resolved through flag → env → profile → default, so a
+                // profile that was set up against another environment keeps its
+                // application on a re-login without repeating the flag.
+                let client_id = config.oauth_client_id.clone();
 
                 // Choose the auth path: --api-key / --with-token => API key,
                 // otherwise the interactive OAuth browser flow.
-                let (cred, method_label) =
+                let (mut cred, method_label) =
                     if let Some(key) = sub.get_one::<String>("api-key").cloned() {
-                        (Credential::ApiKey { key }, "API key")
+                        (
+                            Credential::ApiKey {
+                                key,
+                                base_url: None,
+                            },
+                            "API key",
+                        )
                     } else if sub.get_flag("with-token") {
                         (
                             Credential::ApiKey {
                                 key: read_token_from_stdin()?,
+                                base_url: None,
                             },
                             "API key",
                         )
                     } else {
-                        (oauth::run_login_flow(&base_url, ctx).await?, "OAuth")
+                        let oauth_config = oauth::OauthConfig {
+                            base_url: &base_url,
+                            client_id: &client_id,
+                        };
+                        (oauth::run_login_flow(oauth_config, ctx).await?, "OAuth")
                     };
 
+                // Bind the credential to the environment it was obtained from.
+                // `auth login` is the one place a `--base-url` override is
+                // meant to change environments; from here on, that binding is
+                // what every other command is checked against.
+                cred.bind_to(&crate::config::normalize_base_url(&base_url));
                 secret_store::store(&config.profile_name, &cred)?;
 
                 // Persist non-secret profile settings; the credential itself
                 // just went to the keyring.
                 let profile = Profile {
                     base_url: Some(base_url.clone()),
+                    // Only persisted when it is not the compiled-in production
+                    // id, so a production profile keeps tracking the binary
+                    // across a rotation instead of pinning today's value.
+                    oauth_client_id: (client_id != oauth::DEFAULT_CLIENT_ID).then_some(client_id),
                     team_context: sub.get_one::<String>("team-context").cloned(),
                 };
 
@@ -442,7 +473,18 @@ impl Cli {
                 if let Ok(Some(cred)) = secret_store::retrieve(&config.profile_name)
                     && let Some(rt) = cred.refresh_token()
                 {
-                    oauth::revoke(&config.base_url, rt).await;
+                    // Revoke at the endpoint that issued the token, never at
+                    // whatever `--base-url` this invocation happens to carry:
+                    // revocation only means anything at the issuer, and sending
+                    // the token anywhere else would disclose it on the way out.
+                    let issuer = config.credential_endpoint(&cred);
+                    if issuer != crate::config::normalize_base_url(&config.base_url) {
+                        ctx.warn(&format!(
+                            "revoking at {issuer}, where this credential was issued — \
+                             not at the endpoint given on the command line"
+                        ));
+                    }
+                    oauth::revoke(&issuer, rt).await;
                 }
                 secret_store::delete(&config.profile_name)?;
                 ctx.info(&format!(
@@ -466,12 +508,26 @@ impl Cli {
                 info.insert("profile".into(), serde_json::json!(config.profile_name));
                 info.insert("base_url".into(), serde_json::json!(config.base_url));
                 info.insert(
+                    "oauth_client_id".into(),
+                    serde_json::json!(config.oauth_client_id),
+                );
+                info.insert(
                     "team_context".into(),
                     serde_json::json!(config.team_context),
                 );
 
-                match secret_store::retrieve(&config.profile_name)? {
-                    Some(Credential::ApiKey { key }) => {
+                let stored = secret_store::retrieve(&config.profile_name)?;
+                // The environment the stored credential may be sent to, which
+                // is the thing to check first when a command is refused.
+                if let Some(ref cred) = stored {
+                    info.insert(
+                        "credential_endpoint".into(),
+                        serde_json::json!(config.credential_endpoint(cred)),
+                    );
+                }
+
+                match stored {
+                    Some(Credential::ApiKey { key, .. }) => {
                         info.insert("auth_type".into(), serde_json::json!("api_key"));
                         info.insert("api_key".into(), serde_json::json!(mask_api_key(&key)));
                     }
@@ -481,6 +537,7 @@ impl Cli {
                         expires_at,
                         token_type,
                         scopes,
+                        ..
                     }) => {
                         info.insert("auth_type".into(), serde_json::json!("oauth"));
                         info.insert(
@@ -508,7 +565,19 @@ impl Cli {
                         match config.explicit_api_key.as_ref() {
                             Some(k) => {
                                 info.insert("auth_type".into(), serde_json::json!("api_key"));
-                                info.insert("api_key".into(), serde_json::json!(mask_api_key(k)));
+                                info.insert(
+                                    "api_key".into(),
+                                    serde_json::json!(mask_api_key(&k.key)),
+                                );
+                                // An exported key is pinned to its environment;
+                                // one passed on the command line is not.
+                                info.insert(
+                                    "credential_endpoint".into(),
+                                    match k.bound_to.as_deref() {
+                                        Some(endpoint) => serde_json::json!(endpoint),
+                                        None => serde_json::json!("(given on the command line)"),
+                                    },
+                                );
                             }
                             None => {
                                 info.insert("auth_type".into(), serde_json::json!("none"));
@@ -549,6 +618,7 @@ impl Cli {
                 let info = serde_json::json!({
                     "profile": config.profile_name,
                     "base_url": config.base_url,
+                    "oauth_client_id": config.oauth_client_id,
                     "team_context": config.team_context,
                     "config_path": ConfigManager::config_file_path()?.to_string_lossy(),
                     "cache_dir": ConfigManager::cache_dir()?.to_string_lossy(),
@@ -569,9 +639,14 @@ impl Cli {
     fn handle_config_import(&mut self, config: &ResolvedConfig) -> Result<()> {
         let api_key = std::env::var("ILERT_API_KEY").ok();
         let base_url = std::env::var("ILERT_BASE_URL").ok();
+        let oauth_client_id = std::env::var("ILERT_OAUTH_CLIENT_ID").ok();
         let team_context = std::env::var("ILERT_TEAM_CONTEXT").ok();
 
-        if api_key.is_none() && base_url.is_none() && team_context.is_none() {
+        if api_key.is_none()
+            && base_url.is_none()
+            && oauth_client_id.is_none()
+            && team_context.is_none()
+        {
             return Err(crate::errors::CliError::user(
                 "No ILERT_* environment variables found to import.",
             )
@@ -580,15 +655,38 @@ impl Cli {
 
         let name = std::env::var("ILERT_PROFILE").unwrap_or_else(|_| config.profile_name.clone());
 
-        // Store the key in the keyring (not plaintext); keep other settings in config.
-        if let Some(key) = api_key {
-            secret_store::store(&name, &Credential::ApiKey { key })?;
-        }
-
+        // Import is additive. Exporting only `ILERT_API_KEY` and importing it
+        // into an existing profile must not blank out the endpoint and OAuth
+        // application that profile was set up with — that would leave its
+        // credential bound to one environment while the profile silently fell
+        // back to production, and nothing would work again until someone
+        // noticed why.
+        let existing = self
+            .config_manager
+            .profile(&name)
+            .cloned()
+            .unwrap_or_default();
         let profile = Profile {
-            base_url,
-            team_context,
+            base_url: base_url.or(existing.base_url),
+            oauth_client_id: oauth_client_id.or(existing.oauth_client_id),
+            team_context: team_context.or(existing.team_context),
         };
+
+        // Store the key in the keyring (not plaintext); keep other settings in
+        // config. The key is bound to the endpoint it belongs to — the imported
+        // one, else the profile's own, else production.
+        if let Some(key) = api_key {
+            let endpoint = crate::config::normalize_base_url(
+                profile.base_url.as_deref().unwrap_or(&config.base_url),
+            );
+            secret_store::store(
+                &name,
+                &Credential::ApiKey {
+                    key,
+                    base_url: Some(endpoint),
+                },
+            )?;
+        }
 
         self.config_manager.save_profile(&name, profile)?;
         self.config_manager.set_default_profile(&name)?;
@@ -1115,6 +1213,48 @@ impl Cli {
 // Command tree builder
 // ---------------------------------------------------------------------------
 
+/// The base URL as far as it can be known before the command line is parsed.
+///
+/// [`Cli::new`] needs it to choose a spec cache, but the parser that reads
+/// `--profile` and `--base-url` cannot be built until that cache has been read.
+/// Those two flags are therefore scanned straight off `argv`; everything else
+/// — `ILERT_BASE_URL`, `ILERT_PROFILE`, the stored profile, the default — comes
+/// from the normal resolution chain.
+///
+/// A misread costs a spec fetch under a different cache key and nothing else:
+/// [`Cli::run`] re-resolves the real configuration from the parsed matches, so
+/// no request is ever sent on the strength of this.
+fn bootstrap_base_url(config_manager: &ConfigManager) -> String {
+    let args: Vec<String> = std::env::args().collect();
+    config_manager
+        .resolve(
+            scan_flag(&args, "--profile").as_deref(),
+            None,
+            scan_flag(&args, "--base-url").as_deref(),
+            None,
+            None,
+        )
+        .base_url
+}
+
+/// The value of a long option on the raw command line, in either
+/// `--flag value` or `--flag=value` form.
+fn scan_flag(args: &[String], flag: &str) -> Option<String> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let Some(tail) = arg.strip_prefix(flag) else {
+            continue;
+        };
+        if tail.is_empty() {
+            return rest.next().cloned();
+        }
+        if let Some(value) = tail.strip_prefix('=') {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn build_command(index: &Option<OperationIndex>) -> Command {
     let mut app = Command::new("ilert")
         .about("The official ilert CLI")
@@ -1158,6 +1298,13 @@ fn build_command(index: &Option<OperationIndex>) -> Command {
                 .long("base-url")
                 .value_name("URL")
                 .help("API base URL (overrides profile)")
+                .global(true),
+        )
+        .arg(
+            Arg::new("oauth-client-id")
+                .long("oauth-client-id")
+                .value_name("ID")
+                .help("OAuth2 client ID (overrides profile; non-production environments)")
                 .global(true),
         )
         .arg(
@@ -1483,7 +1630,10 @@ fn build_auth_command() -> Command {
             echo $KEY | ilert auth login --with-token  Headless API-key login (stdin)\n  \
             ilert auth whoami                          Check who you are\n  \
             ilert auth show                            Show current auth (secrets masked)\n\n\
-            No browser available (e.g. over SSH)? Use --with-token or set ILERT_API_KEY.",
+            No browser available (e.g. over SSH)? Use --with-token or set ILERT_API_KEY.\n\n\
+            Another ilert environment? Give it its own profile — the endpoint and the\n\
+            OAuth application that goes with it are stored together:\n  \
+            ilert --profile <name> auth login --base-url <url> --oauth-client-id <id>",
         )
         .subcommand(
             Command::new("login")

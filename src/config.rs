@@ -17,6 +17,11 @@ const DEFAULT_BASE_URL: &str = "https://api.ilert.com";
 pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// OAuth2 application to authenticate as. Only set on profiles pointing at
+    /// a non-production environment, which register their own application —
+    /// production is left unset so it tracks the binary's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team_context: Option<String>,
 }
@@ -29,17 +34,111 @@ pub struct ConfigFile {
     pub profiles: HashMap<String, Profile>,
 }
 
+/// An API key carrying a single invocation, and where it may be sent.
+///
+/// The two ways of supplying one are not equally deliberate. A key typed on the
+/// command line arrives next to the endpoint it is meant for, so the pairing is
+/// the operator's own. A key inherited from `ILERT_API_KEY` was exported for the
+/// environment the shell (or the CI job) is set up for, and its holder never saw
+/// the command line that later picks it up — so it stays bound to that
+/// environment and a `--base-url` cannot redirect it.
+#[derive(Debug, Clone)]
+pub struct ExplicitApiKey {
+    pub key: String,
+    /// Normalized endpoint this key may be sent to; `None` when it may go
+    /// wherever the command line says.
+    pub bound_to: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     /// API key supplied explicitly via `--api-key` or `ILERT_API_KEY`.
     /// Highest precedence and never persisted to the keyring.
-    pub explicit_api_key: Option<String>,
+    pub explicit_api_key: Option<ExplicitApiKey>,
     pub base_url: String,
+    /// The endpoint stored in the profile itself, before any flag or environment
+    /// override. Used to place credentials that predate endpoint binding.
+    pub profile_base_url: Option<String>,
+    /// OAuth2 application this profile authenticates as. Always populated —
+    /// [`crate::oauth::DEFAULT_CLIENT_ID`] when nothing overrides it.
+    pub oauth_client_id: String,
     pub team_context: Option<String>,
     pub profile_name: String,
 }
 
 impl ResolvedConfig {
+    /// The endpoint and application identity for this profile's OAuth calls.
+    pub fn oauth(&self) -> crate::oauth::OauthConfig<'_> {
+        crate::oauth::OauthConfig {
+            base_url: &self.base_url,
+            client_id: &self.oauth_client_id,
+        }
+    }
+
+    /// The environment a stored credential belongs to, normalized.
+    ///
+    /// Credentials written before endpoint binding existed carry nothing, so
+    /// they fall back to the profile's own endpoint and then to production —
+    /// which is where such a credential must have come from, since login has
+    /// always persisted the base URL it was given. The fallbacks deliberately
+    /// never consult [`Self::base_url`]: that is the value an override can
+    /// control, and trusting it would answer the question with the question.
+    pub fn credential_endpoint(&self, cred: &Credential) -> String {
+        let source = cred
+            .base_url()
+            .or(self.profile_base_url.as_deref())
+            .unwrap_or(DEFAULT_BASE_URL);
+        normalize_base_url(source)
+    }
+
+    /// Refuse to hand a stored credential to an endpoint it was not issued for.
+    ///
+    /// `--base-url` (and `ILERT_BASE_URL`) can point a command anywhere, but a
+    /// profile's credential belongs to exactly one environment: sending a
+    /// production token to another host discloses it to an operator who should
+    /// never have held it. Environments get their own profile; an endpoint that
+    /// genuinely needs an ad-hoc credential gets it passed in explicitly.
+    pub fn ensure_credential_matches_endpoint(&self, cred: &Credential) -> Result<()> {
+        let issued_for = self.credential_endpoint(cred);
+        let target = normalize_base_url(&self.base_url);
+        if issued_for == target {
+            return Ok(());
+        }
+        Err(CliError::CredentialEndpointMismatch {
+            message: format!(
+                "Refusing to send profile '{profile}' credentials to {target} — they were issued for {issued_for}.\n\
+                 Log in to a separate profile for that environment:\n  \
+                 ilert --profile <name> auth login --base-url {target}\n\
+                 Then select it with --profile (or ILERT_PROFILE). To authenticate a single \
+                 invocation instead, pass --api-key on the command line.",
+                profile = self.profile_name,
+            ),
+        }
+        .into())
+    }
+
+    /// Refuse to send an inherited API key somewhere its environment does not
+    /// point. See [`ExplicitApiKey`] for why an exported key is treated as
+    /// belonging to an environment while a flag key is not.
+    pub fn ensure_explicit_key_matches_endpoint(&self, key: &ExplicitApiKey) -> Result<()> {
+        let Some(bound_to) = key.bound_to.as_deref() else {
+            return Ok(());
+        };
+        let target = normalize_base_url(&self.base_url);
+        if bound_to == target {
+            return Ok(());
+        }
+        Err(CliError::CredentialEndpointMismatch {
+            message: format!(
+                "Refusing to send the API key from ILERT_API_KEY to {target} — this environment \
+                 points at {bound_to}.\n\
+                 Pass --api-key on the command line to send a key to an endpoint of your own \
+                 choosing, or set ILERT_BASE_URL={target} if that is where this key belongs.",
+            ),
+        }
+        .into())
+    }
+
     /// Resolve the final `Authorization: Bearer` value, silently refreshing (and
     /// re-persisting) an OAuth credential when it is at/near expiry.
     ///
@@ -47,17 +146,21 @@ impl ResolvedConfig {
     /// There is no third source: `config.json` holds settings, never secrets.
     pub async fn resolve_credential(&self) -> Result<String> {
         // 1. Explicit api key (transient — never persisted).
-        if let Some(key) = &self.explicit_api_key {
+        if let Some(explicit) = &self.explicit_api_key {
             ensure_secure_base_url(&self.base_url)?;
-            return Ok(key.clone());
+            self.ensure_explicit_key_matches_endpoint(explicit)?;
+            return Ok(explicit.key.clone());
         }
 
         // 2. Stored credential for this profile.
         if let Some(cred) = crate::secret_store::retrieve(&self.profile_name)? {
+            // Before anything leaves the process — including the refresh
+            // exchange below, which is itself a request carrying a secret.
+            self.ensure_credential_matches_endpoint(&cred)?;
             return match cred {
-                Credential::ApiKey { key } => {
+                Credential::ApiKey { ref key, .. } => {
                     ensure_secure_base_url(&self.base_url)?;
-                    Ok(key)
+                    Ok(key.clone())
                 }
                 Credential::OAuth { .. } => self.bearer_from_oauth(cred).await,
             };
@@ -68,11 +171,17 @@ impl ResolvedConfig {
 
     /// Like [`resolve_credential`], but returns `None` instead of erroring when
     /// no credential is available (for commands where auth is optional).
+    ///
+    /// A credential belonging to another environment counts as unavailable: an
+    /// event send authenticates with its integration key, so the right outcome
+    /// is to leave the profile's token at home, not to fail the send.
     pub async fn resolve_credential_opt(&self) -> Result<Option<String>> {
         match self.resolve_credential().await {
             Ok(value) => Ok(Some(value)),
             Err(e) => match e.downcast_ref::<CliError>() {
-                Some(CliError::NotAuthenticated) => Ok(None),
+                Some(CliError::NotAuthenticated | CliError::CredentialEndpointMismatch { .. }) => {
+                    Ok(None)
+                }
                 _ => Err(e),
             },
         }
@@ -89,8 +198,8 @@ impl ResolvedConfig {
                 "OAuth session expired and no refresh token is stored. Run `ilert auth login` again.",
             )
         })?;
-        let resp = crate::oauth::refresh(&self.base_url, refresh_token).await?;
-        let mut refreshed = resp.into_credential();
+        let resp = crate::oauth::refresh(self.oauth(), refresh_token).await?;
+        let mut refreshed = resp.into_credential(&self.base_url);
         // Preserve the existing refresh token if the server didn't rotate it.
         if let Credential::OAuth {
             refresh_token: rt, ..
@@ -102,6 +211,29 @@ impl ResolvedConfig {
         crate::secret_store::store(&self.profile_name, &refreshed)?;
         Ok(refreshed.bearer_value().to_string())
     }
+}
+
+/// A canonical form of a base URL, for binding a credential to an environment
+/// and for comparing one against the endpoint a command is about to use.
+///
+/// Scheme and host are case-insensitive and a default port is not part of an
+/// endpoint's identity, so those are folded. **The path is not**: an instance can
+/// live under a path prefix, which makes `https://host/a` and `https://host/b`
+/// different environments that must not share credentials.
+pub fn normalize_base_url(base_url: &str) -> String {
+    let Ok(url) = url::Url::parse(base_url) else {
+        // Not a URL at all. It will be rejected before anything is sent; return
+        // something stable so the comparison stays meaningful until then.
+        return base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    };
+    let mut out = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    // `port` is `None` when the port is the scheme's default, which is what
+    // makes `https://host` and `https://host:443` the same environment.
+    if let Some(port) = url.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    out.push_str(url.path().trim_end_matches('/'));
+    out
 }
 
 /// Reject sending credentials to a non-HTTPS endpoint. Cleartext HTTP is only
@@ -176,25 +308,69 @@ impl ConfigManager {
         profile_override: Option<&str>,
         api_key_override: Option<&str>,
         base_url_override: Option<&str>,
+        oauth_client_id_override: Option<&str>,
         team_context_override: Option<&str>,
     ) -> ResolvedConfig {
-        let profile_name = profile_override
-            .map(String::from)
-            .or_else(|| std::env::var("ILERT_PROFILE").ok())
+        // The profile the environment selects on its own, and the one this
+        // invocation actually runs as. They are resolved separately because an
+        // exported API key belongs to the former: `--profile` is part of the
+        // command line, so letting it pick the profile an inherited key is bound
+        // to would let the command line choose its own binding — and
+        // `ILERT_API_KEY=production-key ilert --profile staging ...` would send
+        // production's key to staging.
+        let ambient_profile_name = std::env::var("ILERT_PROFILE")
+            .ok()
             .or_else(|| self.config.default_profile.clone())
             .unwrap_or_else(|| "default".to_string());
 
+        let profile_name = profile_override
+            .map(String::from)
+            .unwrap_or_else(|| ambient_profile_name.clone());
+
         let profile = self.config.profiles.get(&profile_name);
 
-        let explicit_api_key = api_key_override
-            .map(String::from)
-            .or_else(|| std::env::var("ILERT_API_KEY").ok());
+        // Where this environment points on its own, before the command line has
+        // a say. An exported API key belongs here, not wherever a flag aims.
+        let ambient_base_url = std::env::var("ILERT_BASE_URL")
+            .ok()
+            .or_else(|| {
+                self.config
+                    .profiles
+                    .get(&ambient_profile_name)
+                    .and_then(|p| p.base_url.clone())
+            })
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
 
+        let explicit_api_key = match api_key_override {
+            Some(key) => Some(ExplicitApiKey {
+                key: key.to_string(),
+                bound_to: None,
+            }),
+            None => std::env::var("ILERT_API_KEY")
+                .ok()
+                .map(|key| ExplicitApiKey {
+                    key,
+                    bound_to: Some(normalize_base_url(&ambient_base_url)),
+                }),
+        };
+
+        // The endpoint this invocation actually talks to, resolved down the full
+        // chain — including the profile the command line selected. Where it
+        // differs from the ambient one, an inherited key is refused above.
         let base_url = base_url_override
             .map(String::from)
             .or_else(|| std::env::var("ILERT_BASE_URL").ok())
             .or_else(|| profile.and_then(|p| p.base_url.clone()))
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+
+        // Resolved on the same chain as the base URL, and for the same reason:
+        // every environment registers its own OAuth application, so the pair has
+        // to move together. Only the production id is compiled in.
+        let oauth_client_id = oauth_client_id_override
+            .map(String::from)
+            .or_else(|| std::env::var("ILERT_OAUTH_CLIENT_ID").ok())
+            .or_else(|| profile.and_then(|p| p.oauth_client_id.clone()))
+            .unwrap_or_else(|| crate::oauth::DEFAULT_CLIENT_ID.to_string());
 
         let team_context = team_context_override
             .map(String::from)
@@ -204,9 +380,16 @@ impl ConfigManager {
         ResolvedConfig {
             explicit_api_key,
             base_url,
+            profile_base_url: profile.and_then(|p| p.base_url.clone()),
+            oauth_client_id,
             team_context,
             profile_name,
         }
+    }
+
+    /// The stored settings for a profile, if it has any.
+    pub fn profile(&self, name: &str) -> Option<&Profile> {
+        self.config.profiles.get(name)
     }
 
     pub fn save_profile(&mut self, name: &str, profile: Profile) -> Result<()> {
@@ -260,7 +443,44 @@ impl ConfigManager {
 
 #[cfg(test)]
 mod tests {
-    use super::check_base_url_scheme;
+    use super::{check_base_url_scheme, normalize_base_url};
+
+    #[test]
+    fn normalization_folds_what_does_not_identify_an_environment() {
+        let canonical = "https://api.ilert.com";
+        for equivalent in [
+            "https://api.ilert.com",
+            "https://api.ilert.com/",
+            "https://API.ILERT.com",
+            "HTTPS://api.ilert.com",
+            "https://api.ilert.com:443",
+        ] {
+            assert_eq!(normalize_base_url(equivalent), canonical, "{equivalent}");
+        }
+    }
+
+    #[test]
+    fn normalization_keeps_what_does_identify_one() {
+        // A path prefix separates two environments on one host, so folding it
+        // would let either one's credentials reach the other.
+        assert_ne!(
+            normalize_base_url("https://gateway.example.com/tenant-a"),
+            normalize_base_url("https://gateway.example.com/tenant-b")
+        );
+        // As do host, scheme and a non-default port.
+        assert_ne!(
+            normalize_base_url("https://api.ilert.com"),
+            normalize_base_url("https://api.ilert.dev")
+        );
+        assert_ne!(
+            normalize_base_url("https://api.ilert.com"),
+            normalize_base_url("https://api.ilert.com:8443")
+        );
+        assert_ne!(
+            normalize_base_url("https://api.ilert.com"),
+            normalize_base_url("http://api.ilert.com")
+        );
+    }
 
     #[test]
     fn https_is_allowed() {
