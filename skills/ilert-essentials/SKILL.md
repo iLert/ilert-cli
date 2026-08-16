@@ -6,26 +6,27 @@ user-invocable: true
 
 # ilert essentials
 
-For migrating an existing setup, read this first and then the relevant
-`migrate-from-*` skill — those cover the mapping, this covers the platform.
+`ilert skills list` is the index of everything else — including the
+`migrate-from-*` playbooks. Migrating an existing setup? Read this first, then
+the relevant one: they cover the mapping, this covers the platform.
 
 ## The object model in one pass
 
-| Object | What it is                                                                                                                                                                                    |
-| --- |-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Event** | What monitoring tools send. `integrationKey` routes it to an alert source                                                                                                                     |
-| **Alert Source** | Receives events. Owns the `escalationPolicy`, the `integrationKey` / `integrationUrl`, and every parsing and grouping setting                                                                 |
-| **Alert** | The actionable thing: `PENDING` → `ACCEPTED` → `RESOLVED`, created by an alert source, driven by an escalation policy, triggers notifications to responders                                   |
-| **Service** | A business capability people subscribe to. Appears on status pages, carries outage history, is attached to sources and named on incidents. Owns no policy and receives no events              |
-| **Incident** | The coordination record above alerts (used on business impact) — multi channel responders, timeline, incident channel. It publishes nothing by itself                                         |
-| **Status update** | The public message posted *from* an incident. This is what reaches status pages and subscribers                                                                                               |
-| **Escalation Policy** | Ordered rules with `escalationTimeout`, targeting users, schedules or teams. Also `repeating` / `frequency`, `delayMin`, `routingKey`                                                         |
-| **Schedule** | `STATIC` or `RECURRING`; `RECURRING` carries `scheduleLayers`. Overrides go through `PUT /schedules/{id}/overrides`                                                                           |
-| **Event Flow** | A routing layer *above* alert sources with its own ingest URL. Nodes: `ROOT`, `DEFINE_BRANCHES`, `ROUTE_EVENT`, `SUPPORT_HOURS`, `WAIT`, `TRANSFORM`                                          |
+| Object | What it is |
+| --- | --- |
+| **Event** | What monitoring tools send. `integrationKey` routes it to an alert source |
+| **Alert Source** | Receives events. Owns the `escalationPolicy`, the `integrationKey` / `integrationUrl`, and every parsing and grouping setting |
+| **Alert** | The actionable thing: `PENDING` → `ACCEPTED` → `RESOLVED`, created by an alert source, driven by an escalation policy, triggers notifications to responders |
+| **Service** | A business capability people subscribe to. Appears on status pages, carries outage history, is attached to sources and named on incidents. Owns no policy and receives no events |
+| **Incident** | The coordination record above alerts (used on business impact) — multi channel responders, timeline, incident channel. It publishes nothing by itself |
+| **Status update** | The public message posted *from* an incident. This is what reaches status pages and subscribers |
+| **Escalation Policy** | Ordered rules with `escalationTimeout`, targeting users, schedules or teams. Also `repeating` / `frequency`, `delayMin`, `routingKey` |
+| **Schedule** | `STATIC` or `RECURRING`; `RECURRING` carries `scheduleLayers`. Overrides go through `PUT /schedules/{id}/overrides` |
+| **Event Flow** | A routing layer *above* alert sources with its own ingest URL. Nodes: `ROOT`, `DEFINE_BRANCHES`, `ROUTE_EVENT`, `SUPPORT_HOURS`, `WAIT`, `TRANSFORM` |
 | **Call Flow** | The same idea for inbound phone calls: `IVR_MENU`, `AUDIO_MESSAGE`, `SUPPORT_HOURS`, `ROUTE_CALL`, `PARALLEL_ROUTE_CALL`, `VOICEMAIL`, `PIN_CODE`, `CREATE_ALERT`, `BLOCK_NUMBERS`, `AGENTIC` |
-| **Alert Action + Connector** | Outbound automation. The Connector holds credentials, the Alert Action binds it to a source with `triggerMode`, `triggerTypes` and ICL `conditions`                                           |
-| **Maintenance Window** | Takes both `services` *and* `alertSources` — communication and suppression in one object                                                                                                      |
-| **Deployment Pipeline / Event** | Deploy traffic, on its own ingest endpoint and its own integration key. Not alert traffic                                                                                                     |
+| **Alert Action + Connector** | Outbound automation. The Connector holds credentials, the Alert Action binds it to a source with `triggerMode`, `triggerTypes` and ICL `conditions` |
+| **Maintenance Window** | Takes both `services` *and* `alertSources` — communication and suppression in one object |
+| **Deployment Pipeline / Event** | Deploy traffic, on its own ingest endpoint and its own integration key. Not alert traffic |
 
 > Node and enum lists grow; check the api-docs rather than treating these as closed.
 
@@ -44,9 +45,9 @@ carries impact. Both can be derived on the source by `priorityTemplate` and
 `ONE_ALERT_GROUPED_PER_WINDOW` and `INTELLIGENT_GROUPING` (the last two consult
 `alertGroupingWindow`). **But an `alertKey` matching an open alert groups
 regardless**, and with a dedicated `integrationType` — not `API`, e.g.
-`PROMETHEUS` — ilert extracts alert keys automatically on best practices. Often
-overlooked, and usually what you wanted. Note the key is trimmed, and compared
-**case-insensitively**, so `SRV-1` and `srv-1` are the same alert.
+`PROMETHEUS` — ilert extracts alert keys automatically. Often overlooked, and
+usually what you wanted. The key is trimmed and compared **case-insensitively**,
+so `SRV-1` and `srv-1` are the same alert.
 
 **`ACCEPTED` stops escalation, by design.** Accepting means a human owns it, so
 nobody gets re-paged. For a "still not resolved" safety net use an Alert Action on
@@ -59,10 +60,10 @@ advances past it. `autoRaiseAlerts` re-raises still-`PENDING` alerts when suppor
 hours begin. Real quiet lives in the recipients' notification preferences, or in a
 flow branch that drops the event.
 
-**Escalation to an empty schedule falls through instantly** — without waiting for
-the escalation timeout. That is a feature, and it is how you chain several
-schedules in a complex on-call setup. It is also why a policy imported before its
-schedules looks correct and pages nobody.
+**Escalation to an empty schedule falls through instantly**, without waiting for
+the escalation timeout. That is how you chain several schedules in a complex
+on-call setup — and why a policy imported before its schedules looks correct and
+pages nobody.
 
 **An event flow drops by absence.** A path that never reaches `ROUTE_EVENT` is
 handed to no alert source and creates no alert. It stays visible in the flow's
@@ -76,8 +77,9 @@ when none match. Use a flow when you need conditions, support hours, transforms 
 a tree.
 
 **Assigning to a team does not restrict anything.** Only `visibility: PRIVATE`
-narrows access. A user who joins a private team becomes a private user, invisible
-to people who could see them before. Public teams are however the suggested best practice to reduce MTTR.
+narrows access, and a user who joins a private team becomes a private user,
+invisible to people who could see them before. Public teams are the suggested best
+practice to reduce MTTR.
 
 **Status is not communication.** Setting a service's status notifies nobody;
 subscribers hear a **Status update** naming that service. That split is what lets
@@ -97,9 +99,8 @@ The CLI resolves a mode before anything else (`ILERT_CLI_MODE` → agent env mar
 can prompt.** In `agent` or `ci` mode a destructive command does not ask and does
 not proceed — it exits **`2`** with a JSON envelope on stderr.
 
-Exit `2` means *"nobody consented"*, not *"it failed"*. Exit `1` is failure.
-Treating `2` as an error and retrying will not help; pass `--yes`, or decide not
-to.
+Exit `2` means *"nobody consented"*, not *"it failed"* (that is exit `1`).
+Retrying will not help; pass `--yes`, or decide not to.
 
 ### What the CLI treats as destructive
 
@@ -114,7 +115,7 @@ no HTTP method would tell you:
 | `PUT /status-pages/{id}/private-subscribers` | Same. The sibling `POST` *adds* and is not destructive |
 | `PUT /escalation-policies/{id}/levels/{level}` | Replaces the level, dropping whoever held it, on a paging path |
 
-And in reverse, two `POST`s are classified **read-only** because they only query:
+In reverse, two `POST`s are classified **read-only** because they only query:
 `POST /incidents/publish-info` (which subscribers an incident would reach) and
 `POST /users/search-email`.
 
@@ -125,9 +126,9 @@ on every write trains people to pass `--yes` unconditionally.
 ### `--all` stops early and only warns on stderr
 
 Pagination caps at **200 pages** — 10,000 items at the default `--max-results` of
-50. Past that it prints a warning to **stderr** and returns what it has, as a
-perfectly valid JSON array. Capture stdout only and a short export looks complete.
-Raise `--max-results`, or narrow with `--from` / `--until` and other filters.
+50. Past that it warns on **stderr** and returns what it has, as a perfectly valid
+JSON array. Capture stdout only and a short export looks complete. Raise
+`--max-results`, or narrow with `--from` / `--until` and other filters.
 
 ### One envelope, two situations
 

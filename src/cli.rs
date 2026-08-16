@@ -1257,7 +1257,10 @@ fn scan_flag(args: &[String], flag: &str) -> Option<String> {
 
 fn build_command(index: &Option<OperationIndex>) -> Command {
     let mut app = Command::new("ilert")
-        .about("The official ilert CLI")
+        .about(
+            "The official ilert CLI\n\n\
+             AI agents: run `ilert skills show ilert-essentials` before your first command.",
+        )
         .version(version::current_version())
         .arg_required_else_help(true)
         .after_help(
@@ -1269,7 +1272,8 @@ fn build_command(index: &Option<OperationIndex>) -> Command {
             ilert incidents create --set summary=... Create an incident\n  \
             ilert event send -k <KEY> -s \"msg\"       Send an alert event\n  \
             ilert status                             Show system overview\n  \
-            ilert dashboard                          Open live TUI dashboard",
+            ilert dashboard                          Open live TUI dashboard\n  \
+            ilert skills show ilert-essentials       Rules and gotchas not covered by --help",
         )
         .arg(
             Arg::new("output")
