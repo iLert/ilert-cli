@@ -49,7 +49,7 @@ almost every routing rule you will find, and they are where to look first:
   serve many escalation paths, chosen per branch, which is exactly what an
   Opsgenie team routing rule did. `SUPPORT_HOURS` covers the time-based branches
   the emitter could never have signaled, and `TRANSFORM` is where an Opsgenie
-  *alert policy* lands. (but remember: for simple routings `routingKey` on the alert source is the best approach and event flow an overkill).
+  *alert policy* lands. (but remember: for simple routings `routingKey` on the alert source is the best approach and an event flow is overkill).
 
 Reach for **additional alert sources** only when branches genuinely need
 different *source-level* settings — a different `integrationType`,
@@ -267,8 +267,9 @@ new one. Enumerate who knows the old number before you start.
 
 Give call routing its own cutover and its own announcement — it is the one part
 of the migration with humans, not machines, on the other end, and the only part
-where the fallback is a caller who cannot get through. Other than that call flows
-offer immense freedom in customizability and empower any use-case imaginable.
+where the fallback is a caller who cannot get through. Beyond that, call flows are
+highly configurable and cover the routing patterns an Opsgenie call-routing setup
+is likely to need.
 
 **`integrationType` changes payload parsing.** Opsgenie's generic API integration
 tempts a generic ilert source. Where a dedicated `integrationType` exists for the
@@ -282,7 +283,7 @@ every level in the moment the alert arrives. If no one is on call anywhere in th
 policy, nobody is notified at all. Import schedules and their shifts before the
 policies that reference them, then verify current coverage — a policy imported
 ahead of its schedules looks perfectly correct and pages no one. This is a feature
-that allows for chaining multiple schedules in complexer on-call scenarios.
+that allows for chaining multiple schedules in more complex on-call scenarios.
 
 **Repeat behaviour lives on the policy, and only the count survives.** Opsgenie
 repeats from the escalation object; ilert uses `repeating` and `frequency` on the
@@ -373,10 +374,10 @@ however, for monitoring tool relevant traffic the asynchronous event API should 
 **Deployment events are a capability you gain.** Opsgenie has no equivalent, so
 nothing migrates, but ilert's **Deployment Events** (`POST /deployment-events`,
 fed by a **Deployment Pipeline** that mints its own `integrationKey` and carries
-its own `integrationType`) correlate deploys with alerts. Teams arriving from
-Opsgenie routinely miss this because they are translating rather than shopping.
-Worth a look once the alerting path is stable. Also worth looking at all the other
-additional features that the ilert platform brings to the table, after successfull completion of the Opsgenie migration.
+its own `integrationType`) correlate deploys with alerts. It is easy to overlook
+during a migration, since there is nothing on the Opsgenie side to translate.
+Worth a look once the alerting path is stable, along with the rest of the ilert
+platform once the migration is complete.
 
 Heartbeats deserve separate attention: an Opsgenie heartbeat that stops being
 pinged raises an alert, so a half-migrated heartbeat is silent in the new system

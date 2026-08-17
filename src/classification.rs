@@ -196,7 +196,7 @@ pub const EXTENSION_KEY: &str = "x-ilert-cli-classification";
 /// Checked-in overrides keyed by `operationId`, applied after the method
 /// default and after any `x-ilert-cli-classification` extension.
 ///
-/// This exists for operations whose spec we do not control yet. Prefer adding
+/// This exists for operations the spec does not yet classify. Prefer adding
 /// the extension to the spec; an entry here is a temporary bridge. Entries that
 /// no longer match an operation in the spec fail `stale_overrides_are_rejected`.
 /// Every entry is one operation reviewed by hand against the policy in the

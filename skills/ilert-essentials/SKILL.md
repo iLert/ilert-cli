@@ -78,8 +78,8 @@ a tree.
 
 **Assigning to a team does not restrict anything.** Only `visibility: PRIVATE`
 narrows access, and a user who joins a private team becomes a private user,
-invisible to people who could see them before. Public teams are the suggested best
-practice to reduce MTTR.
+invisible to people who could see them before. The suggested default is to keep
+teams `PUBLIC` and scope write access rather than visibility.
 
 **Status is not communication.** Setting a service's status notifies nobody;
 subscribers hear a **Status update** naming that service. That split is what lets
@@ -98,9 +98,9 @@ what happened, poll `/alerts` by alert key.
 
 Relevant when you use `ilert api` or read raw responses.
 
-**The spec documents success only.** There is no `400`, `401`, `402` or `429`
-anywhere in it, and its `RestError` schema omits `code` and `detailedCode` and is
-referenced by nothing. Do not generate error handling from it. Model every non-2xx
+**The spec documents the success path.** It does not describe `400`, `401`, `402`
+or `429` responses, and its `RestError` schema omits `code` and `detailedCode`, so
+error handling generated from the spec will not match the wire. Model every non-2xx
 as `{status, message, code, details?, detailedCode?}` and branch on `code`.
 
 A missing `Authorization` header is `401`; an unknown, revoked or malformed **API key is `403`** with
@@ -119,21 +119,22 @@ hard-coded against the default.
 differ widely — tens on some collections, a couple of hundred on others — and
 `?include=` lowers the cap further sometimes on the endpoints that support it. Read the cap
 off `max-results`' `maximum` in the spec for the operation you are calling rather
-than assuming one number everywhere; that is what the CLI does. There is no total
-count, no next-page link, and usually no sort parameter: ordering is server-defined, so offset
-paging over a collection that is changing underneath you will skip and duplicate
-rows. `/heartbeat-monitors` pages by `cursor` rather than `start-index`.
+than assuming one number everywhere; that is what the CLI does. Paging is
+offset-based: there is no total count, no next-page link, and usually no sort
+parameter, with ordering server-defined — so, as with any offset scheme, paging a
+collection that changes underneath you can skip or repeat rows.
+`/heartbeat-monitors` pages by `cursor` rather than `start-index`.
 
 **`include` is opt-in and there is no `PATCH`.** `integrationKey`,
 `escalationRules`, `customDetails`, alert-source templates, alert-action
 `conditions` and schedule `shifts` are omitted unless you ask for them via
 `?include=`. `PUT` is the only update verb and is a **full replace** — so "GET it,
-change one field, PUT it back" silently wipes everything the GET did not return. Include fields
-are most of them sub-dependencies or read-only fields. Build the PUT body explicitly.
+change one field, PUT it back" drops everything the GET did not return. Most
+`include` fields are sub-dependencies or read-only. Build the PUT body explicitly.
 
 **`null` does not always mean "not configured".** `integrationKey`,
 `integrationUrl` come back `null` for callers without
-update permission — silently, with a `200`. Read a `null` there as "not
+update permission, on an ordinary `200`. Read a `null` there as "not
 available to this key", and do not conclude the field is unset.
 
 **`404` means the entity is not there for you.** Usually that is the obvious
@@ -144,7 +145,7 @@ it; widen the key's scope or the team context and ask again.
 
 **Some standard enums in the spec are illustrative.** `TimeZone` lists four zones while the
 server takes any IANA id; integration, connector and priority types grow most
-releases. Deprecation appears only in prose field descriptions, never as the
+releases. Deprecation is noted in prose field descriptions rather than through the
 OpenAPI `deprecated` flag. Treat enums as open, and ignore unknown JSON properties
 — the compatibility promise is that fields get added, never removed.
 
@@ -153,9 +154,9 @@ OpenAPI `deprecated` flag. Treat enums as open, and ignore unknown JSON properti
 ISO-8601 parser, never a fixed pattern. Input is lenient and accepts offsets, but
 nothing echoes your offset back.
 
-**If it is not in `openapi.json`, do not build on it.** The spec is the public
-surface; anything else you may find reachable might be internal, in alpha and could change without
-notice.
+**If it is not in `openapi.json`, do not build on it.** The spec is the supported
+public surface; anything else you may find reachable is internal or in alpha, and
+may change without notice.
 
 ## Driving the CLI
 

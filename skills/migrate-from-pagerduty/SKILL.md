@@ -77,10 +77,9 @@ escalation policy drives.
 
 ## Event Orchestration becomes an Event Flow
 
-PD's Event Orchestration — and the Event Rules it superseded, which PagerDuty has
-deprecated — maps onto an ilert **Event Flow**. Anyone still on Event Rules is
-migrating off something PD is retiring anyway, so rebuild the intent in a flow
-rather than transliterate rule by rule.
+PD's Event Orchestration — and the older Event Rules it superseded — maps onto an
+ilert **Event Flow**. Either way, rebuild the intent in a flow rather than
+transliterate rule by rule.
 
 The shapes line up well. An Event Flow is a layer that sits *above* alert sources
 rather than beside them: it has its own `integrationKey` / `integrationUrl`, so
@@ -183,8 +182,7 @@ was expressing.
 `acknowledgement_timeout` re-triggers an acknowledged incident and re-notifies
 the assignee. ilert takes the opposite position deliberately: `ACCEPTED` means a
 human has picked the alert up, so escalation stops rather than continuing to page
-someone who already answered — which removes the most common source of repeat
-paging in a PD setup.
+someone who already answered — an accepted alert does not re-page on its own.
 
 Where the timeout was doing real work as a safety net against an
 accepted-and-forgotten alert, rebuild it as an **Alert Action** rather than as
@@ -192,8 +190,7 @@ escalation. `triggerTypes` includes `v-alert-not-resolved`, which fires on an
 alert that is still open rather than on a state change; check the api-docs for
 its configuration. From there you can post to a channel, notify a second
 responder or declare an incident. The reminder becomes an explicit rule you can
-see and scope with `conditions`, instead of an implicit re-page nobody
-configured on purpose.
+see and scope with `conditions`, rather than a timeout that re-pages implicitly.
 
 Do not reach for `repeating`/`frequency` as the substitute. Those repeat the
 policy for an alert that was *never* accepted, which is PD's `num_loops`, not its
@@ -239,7 +236,7 @@ integration defaults.
 escalation rule pointing at a schedule with nobody on call advances to the next
 rule *without waiting for the escalation timeout*, so a policy can burn through
 every level the moment the alert arrives. This is a feature that allows for
-chaining multiple schedules in complexer on-call scenarios. It is also how an
+chaining multiple schedules in more complex on-call scenarios. It is also how an
 unfinished import fails: if no one is on call anywhere in the policy, nobody is
 notified at all. Import schedules and their shifts *before* the policies that
 reference them, and verify current on-call coverage before cutover — a policy
@@ -283,8 +280,8 @@ provision a new one, so every runbook, contract, out-of-hours notice and third
 party holding the old number has to be updated, or you keep the old number alive
 at your carrier and forward it.
 
-Other than that call flows offer immense freedom in customizability and empower
-any use-case imaginable.
+Beyond those two points, call flows are highly configurable and cover the routing
+patterns a PD live-call setup is likely to need.
 
 ## Order of migration
 
@@ -384,8 +381,9 @@ joins a private team becomes a private user — invisible to people who could se
 them before, which tends to surface as "why can't I find this user in the
 dropdown".
 
-> We still advocate as best practice to align in a scenario where all teams are public and not
-to restrict visibility but just write access through teams, as that usually results in the best MTTR improvements
+> ilert's suggested default is to keep teams `PUBLIC` and use them to scope write
+> access rather than visibility. Restricting who can *change* configuration is
+> usually the intent; restricting who can *see* alerts tends to cost response time.
 
 ## A word on IaC
 
