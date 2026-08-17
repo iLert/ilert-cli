@@ -47,7 +47,12 @@ pub async fn run_watch(
             // watch is the same output repeated, not a different one.
             Ok((_, body)) => ctx.print_response(&body)?,
             Err(e) => {
-                eprintln!("Error: {e}");
+                // A watch clears the screen and redraws every tick, so an
+                // escape sequence in a server error message would be replayed
+                // for as long as the command runs — and it is the one place
+                // where an error is printed instead of returned to
+                // `output::print_error`.
+                eprintln!("Error: {}", crate::sanitize::terminal_string(e.to_string()));
             }
         }
 

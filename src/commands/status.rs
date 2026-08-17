@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::cli::RunContext;
 use crate::http::HttpClient;
 use crate::output::OutputFormat;
+use crate::sanitize::{terminal_string, terminal_text};
 
 pub fn command() -> Command {
     Command::new("status").about("Show system status overview")
@@ -67,7 +68,13 @@ pub async fn handle(_matches: &ArgMatches, client: &HttpClient, ctx: &RunContext
                 eprintln!("  {} {count} open alert(s)", "!!".red().bold());
             }
         }
-        Err(e) => eprintln!("  {} Could not fetch alerts: {e}", "?".yellow()),
+        // An error can carry a message the gateway wrote, so it is no safer to
+        // print than the data it stands in for.
+        Err(e) => eprintln!(
+            "  {} Could not fetch alerts: {}",
+            "?".yellow(),
+            terminal_string(e.to_string())
+        ),
     }
 
     // Incidents
@@ -94,13 +101,17 @@ pub async fn handle(_matches: &ArgMatches, client: &HttpClient, ctx: &RunContext
                         eprintln!(
                             "    {} {}",
                             colorize_incident_status(status),
-                            summary.dimmed()
+                            terminal_text(summary).dimmed()
                         );
                     }
                 }
             }
         }
-        Err(e) => eprintln!("  {} Could not fetch incidents: {e}", "?".yellow()),
+        Err(e) => eprintln!(
+            "  {} Could not fetch incidents: {}",
+            "?".yellow(),
+            terminal_string(e.to_string())
+        ),
     }
 
     // Services
@@ -148,12 +159,20 @@ pub async fn handle(_matches: &ArgMatches, client: &HttpClient, ctx: &RunContext
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("(unnamed)");
-                        eprintln!("    {} {}", colorize_service_status(status), name);
+                        eprintln!(
+                            "    {} {}",
+                            colorize_service_status(status),
+                            terminal_text(name)
+                        );
                     }
                 }
             }
         }
-        Err(e) => eprintln!("  {} Could not fetch services: {e}", "?".yellow()),
+        Err(e) => eprintln!(
+            "  {} Could not fetch services: {}",
+            "?".yellow(),
+            terminal_string(e.to_string())
+        ),
     }
 
     eprintln!();
@@ -211,8 +230,12 @@ fn extract_items(value: &Value) -> Vec<&Value> {
     Vec::new()
 }
 
+/// Both colorizers escape first and match afterwards. The recognised states are
+/// plain ASCII, so escaping cannot stop one from matching — but the `_` arm
+/// prints whatever the API sent, and that is the arm an attacker aims for.
 fn colorize_incident_status(status: &str) -> String {
-    match status {
+    let status = &terminal_text(status);
+    match status.as_str() {
         "INVESTIGATING" => status.yellow().bold().to_string(),
         "IDENTIFIED" => status.cyan().bold().to_string(),
         "MONITORING" => status.blue().to_string(),
@@ -222,11 +245,64 @@ fn colorize_incident_status(status: &str) -> String {
 }
 
 fn colorize_service_status(status: &str) -> String {
-    match status {
+    let status = &terminal_text(status);
+    match status.as_str() {
         "OPERATIONAL" => status.green().to_string(),
         "DEGRADED" | "DEGRADED_PERFORMANCE" => status.yellow().to_string(),
         s if s.contains("OUTAGE") => status.red().bold().to_string(),
         "UNDER_MAINTENANCE" => status.blue().to_string(),
         _ => status.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dashboard prints a state string straight through when it does not
+    /// recognise it, which is exactly the case a hostile value arranges for.
+    #[test]
+    fn an_unrecognised_state_cannot_write_escapes_to_the_terminal() {
+        // Colour off so any escape left in the output came from the payload —
+        // "OK\rMAJOR_OUTAGE" still matches the outage arm and would otherwise
+        // arrive wrapped in our own codes.
+        let _colors = crate::testutil::colors(false);
+        for state in [
+            "\u{1b}[2JOPERATIONAL",
+            "\u{1b}]52;c;cm0gLXJmIC8=\u{7}",
+            "OK\rMAJOR_OUTAGE",
+            "\u{9b}31mDEGRADED",
+            "\u{202E}LANOITAREPO",
+        ] {
+            for rendered in [
+                colorize_service_status(state),
+                colorize_incident_status(state),
+            ] {
+                assert!(!rendered.contains('\u{1b}'), "{state:?} -> {rendered:?}");
+                assert!(!rendered.contains('\u{7}'), "{state:?} -> {rendered:?}");
+                assert!(!rendered.contains('\r'), "{state:?} -> {rendered:?}");
+                assert!(!rendered.contains('\u{9b}'), "{state:?} -> {rendered:?}");
+                assert!(!rendered.contains('\u{202E}'), "{state:?} -> {rendered:?}");
+            }
+        }
+    }
+
+    /// Escaping runs before the match, so the states we do know must still be
+    /// recognised — and coloured with our own codes.
+    #[test]
+    fn the_known_states_still_match_and_still_colour() {
+        let _colors = crate::testutil::colors(true);
+        let operational = colorize_service_status("OPERATIONAL");
+        let investigating = colorize_incident_status("INVESTIGATING");
+        let outage = colorize_service_status("MAJOR_OUTAGE");
+
+        for (rendered, text) in [
+            (&operational, "OPERATIONAL"),
+            (&investigating, "INVESTIGATING"),
+            (&outage, "MAJOR_OUTAGE"),
+        ] {
+            assert!(rendered.contains(text), "{rendered:?}");
+            assert!(rendered.contains('\u{1b}'), "not coloured: {rendered:?}");
+        }
     }
 }

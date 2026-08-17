@@ -3,16 +3,59 @@ use std::time::Duration;
 use anyhow::Result;
 use reqwest::{Client, Method, Response};
 use serde_json::Value;
+use url::Url;
 
+use crate::endpoint::Endpoint;
 use crate::errors::CliError;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Backoff base for `429`, which needs its own scale.
+///
+/// The API rate-limits in **fixed one-minute windows** — one bucket for REST
+/// calls per token, another for events per integration key — and sends neither
+/// `Retry-After` nor any rate-limit header. The allowance itself is not ours to
+/// know: it varies per account, so this backs off against the shape of the limit
+/// (a fixed window) rather than against a number.
+///
+/// Sub-second backoff therefore retries three times
+/// inside the very window that is rejecting us, fails, and spends three more
+/// calls from the same budget on the way. Starting at 5 s (5 → 10 → 20) gives
+/// the window a real chance to roll over.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// A wait long enough that the caller deserves to know why nothing is happening.
+const WAIT_NOTICE_THRESHOLD: Duration = Duration::from_secs(2);
+
 /// HTTP status codes that are safe to retry.
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504)
+}
+
+/// How long to wait before retrying a response we have already received.
+///
+/// `attempt` is the 0-based index of the attempt that just failed.
+fn retry_delay(status: u16, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if status == 429 {
+        // Honour `Retry-After` if it ever appears — today it does not, but a
+        // server that starts sending one knows better than this heuristic.
+        return retry_after.unwrap_or(RATE_LIMIT_BACKOFF * 2u32.pow(attempt));
+    }
+    INITIAL_BACKOFF * 2u32.pow(attempt)
+}
+
+/// `Retry-After` in delta-seconds form. The HTTP-date form is not parsed: the
+/// API does not send either, and guessing at clock skew to honour a date is a
+/// worse failure than falling back to our own backoff.
+fn retry_after(response: &HttpResponse) -> Option<Duration> {
+    response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// Headers a caller may never set, wherever the value came from: `-H`, an
@@ -105,7 +148,10 @@ pub struct HttpResponse {
 
 pub struct HttpClient {
     client: Client,
-    base_url: String,
+    /// Where this client is allowed to send. Parsed once here so that every
+    /// request resolves through [`Endpoint::resolve`] rather than through a
+    /// `format!` that cannot tell a path from a new host.
+    endpoint: Endpoint,
     api_key: Option<String>,
     team_context: Option<String>,
     extra_headers: Vec<(String, String)>,
@@ -114,7 +160,11 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new(base_url: String, api_key: Option<String>, team_context: Option<String>) -> Self {
+    pub fn new(
+        base_url: &str,
+        api_key: Option<String>,
+        team_context: Option<String>,
+    ) -> Result<Self> {
         let client = crate::client::builder()
             .timeout(REQUEST_TIMEOUT)
             // A REST API has no business redirecting us, and following one
@@ -123,15 +173,15 @@ impl HttpClient {
             .build()
             .expect("Failed to build HTTP client");
 
-        Self {
+        Ok(Self {
             client,
-            base_url,
+            endpoint: Endpoint::parse(base_url)?,
             api_key,
             team_context,
             extra_headers: Vec::new(),
             debug: false,
             verbose: false,
-        }
+        })
     }
 
     pub fn with_debug(mut self, debug: bool) -> Self {
@@ -197,13 +247,24 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<Value>,
     ) -> Result<HttpResponse> {
-        let url = format!("{}{}", self.base_url, path);
+        // The last point at which a request can be re-targeted, and therefore
+        // the one that has to decide. Resolved once, before the retry loop, so
+        // a rejected path costs nothing and every attempt sends the same URL.
+        let url = self.endpoint.resolve(path)?;
         let mut last: Option<HttpResponse> = None;
         let mut last_err: Option<anyhow::Error> = None;
+        let mut delay: Option<Duration> = None;
 
         for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let backoff = INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+            if let Some(backoff) = delay.take() {
+                // A rate-limit wait is measured in seconds, not milliseconds, so
+                // silence here reads as a hang.
+                if backoff >= WAIT_NOTICE_THRESHOLD {
+                    eprintln!(
+                        "Rate limited. Waiting {}s before retrying...",
+                        backoff.as_secs()
+                    );
+                }
                 tokio::time::sleep(backoff).await;
             }
 
@@ -214,6 +275,11 @@ impl HttpClient {
             match result {
                 Ok(response) => {
                     if is_retryable_status(response.status) && attempt < MAX_RETRIES {
+                        delay = Some(retry_delay(
+                            response.status,
+                            attempt,
+                            retry_after(&response),
+                        ));
                         last = Some(response);
                         continue;
                     }
@@ -222,6 +288,7 @@ impl HttpClient {
                 Err(e) => {
                     // Retry on network/timeout errors
                     if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                        delay = Some(INITIAL_BACKOFF * 2u32.pow(attempt));
                         last_err = Some(e);
                         continue;
                     }
@@ -241,12 +308,12 @@ impl HttpClient {
     async fn send_once(
         &self,
         method: &Method,
-        url: &str,
+        url: &Url,
         query: &[(String, String)],
         headers: &[(String, String)],
         body: Option<Value>,
     ) -> Result<HttpResponse> {
-        let mut req = self.client.request(method.clone(), url);
+        let mut req = self.client.request(method.clone(), url.clone());
 
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {key}"));
@@ -274,7 +341,7 @@ impl HttpClient {
                     "debug: {} {} body={}",
                     method,
                     url,
-                    serde_json::to_string(&crate::preview::redact_body(body)).unwrap_or_default()
+                    debug_request_body(body)
                 );
             }
             // The unredacted body goes on the wire — redaction is a property of
@@ -307,7 +374,13 @@ impl HttpClient {
         if self.verbose {
             eprintln!("< HTTP {status}");
             for (k, v) in &response_headers {
-                eprintln!("< {k}: {}", redact_header(k, v));
+                // Server-controlled, printed one per line: sanitize so a `\r`
+                // cannot forge a header line that was never on the wire.
+                eprintln!(
+                    "< {}: {}",
+                    crate::sanitize::terminal_text(k),
+                    crate::sanitize::terminal_text(&redact_header(k, v))
+                );
             }
         }
 
@@ -419,12 +492,34 @@ const DEBUG_BODY_PREVIEW_CHARS: usize = 200;
 /// A body that is not JSON cannot be key-redacted, so it is only truncated.
 /// That is the honest limit of this approach: `--debug` on an endpoint that
 /// returns a bare token as plain text will still show it.
+///
+/// The preview also gets escaped: an HTML or plain-text error page reaches this
+/// verbatim, and it goes straight to a terminal.
+/// The request body as `--debug` prints it: sensitive keys redacted, then
+/// escaped.
+///
+/// Escaping a serialized JSON document is not redundant. `serde_json` escapes
+/// the C0 range inside strings, so `ESC` and `BEL` come out as `` and
+/// `` on their own — but it emits C1 (U+009B is CSI, U+009D is OSC) and
+/// the bidi controls verbatim as UTF-8, and a terminal decoding UTF-8 dispatches
+/// those exactly like `ESC [` and `ESC ]`. The body is not always ours either:
+/// interactive mode fills enum fields with values taken from the spec.
+///
+/// This is terminal output, not machine-readable output — `--debug` prose on
+/// stderr, already truncated and redacted — so escaping it breaks no contract.
+fn debug_request_body(body: &Value) -> String {
+    let rendered =
+        serde_json::to_string(&crate::preview::redact_body(body)).unwrap_or_else(|_| String::new());
+    crate::sanitize::terminal_string(rendered)
+}
+
 fn debug_body_preview(text: &str) -> String {
     let rendered = match serde_json::from_str::<Value>(text) {
         Ok(value) => serde_json::to_string(&crate::preview::redact_body(&value))
             .unwrap_or_else(|_| text.to_string()),
         Err(_) => text.to_string(),
     };
+    let rendered = crate::sanitize::terminal_text(&rendered);
     // Truncate on a char boundary (byte slicing can panic on UTF-8).
     rendered.chars().take(DEBUG_BODY_PREVIEW_CHARS).collect()
 }
@@ -474,10 +569,11 @@ mod tests {
     #[test]
     fn verbose_lists_the_headers_the_client_adds_itself() {
         let client = HttpClient::new(
-            "https://api.ilert.com".into(),
+            "https://api.ilert.com",
             Some("secret-key".into()),
             Some("42".into()),
         )
+        .unwrap()
         .with_extra_headers(vec![("X-Request-Id".into(), "abc".into())]);
 
         let names: Vec<String> = client
@@ -502,10 +598,11 @@ mod tests {
     #[test]
     fn verbose_never_prints_a_credential_or_the_team_context() {
         let client = HttpClient::new(
-            "https://api.ilert.com".into(),
+            "https://api.ilert.com",
             Some("super-secret".into()),
             Some("team-42".into()),
-        );
+        )
+        .unwrap();
         let rendered: String = client
             .effective_request_headers(&[], false)
             .into_iter()
@@ -524,6 +621,45 @@ mod tests {
         assert!(!rendered.contains("hunter2"));
         assert!(rendered.contains(crate::preview::REDACTED));
         assert!(rendered.contains("smtp"));
+    }
+
+    /// The request body `--debug` echoes is serialized JSON, and `serde_json`
+    /// escapes only the C0 range inside strings — C1 and bidi go out as UTF-8,
+    /// where a terminal reads U+009B as CSI and U+009D as OSC. The body is not
+    /// necessarily ours either: interactive mode fills enum fields from the spec.
+    #[test]
+    fn the_debug_request_body_escapes_what_serde_lets_through() {
+        let body = serde_json::json!({
+            "mode": "\u{9d}52;c;cm0gLXJmIC8=\u{9c}",
+            "host": "\u{202E}moc.elpmaxe.live",
+            "note": "a\u{9b}2Jb",
+        });
+
+        let rendered = debug_request_body(&body);
+        for c in ['\u{9b}', '\u{9c}', '\u{9d}', '\u{202E}', '\u{1b}'] {
+            assert!(!rendered.contains(c), "{c:?} survived: {rendered:?}");
+        }
+        assert!(rendered.contains("\\u{009B}"), "{rendered:?}");
+        assert!(rendered.contains("\\u{009D}"), "{rendered:?}");
+        assert!(rendered.contains("\\u{202E}"), "{rendered:?}");
+    }
+
+    #[test]
+    fn the_debug_request_body_still_redacts_and_still_reads() {
+        let body = serde_json::json!({ "name": "smtp", "apiKey": "hunter2" });
+        let rendered = debug_request_body(&body);
+        assert!(!rendered.contains("hunter2"), "{rendered:?}");
+        assert!(rendered.contains(crate::preview::REDACTED), "{rendered:?}");
+        assert!(rendered.contains("smtp"), "{rendered:?}");
+    }
+
+    /// The response side has the same exposure and the same fix.
+    #[test]
+    fn the_debug_response_preview_escapes_c1_and_bidi_too() {
+        let body = "{\"summary\":\"a\u{9b}2J\u{202E}b\"}";
+        let rendered = debug_body_preview(body);
+        assert!(!rendered.contains('\u{9b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{202E}'), "{rendered:?}");
     }
 
     /// Redaction runs before truncation, so a credential sitting past the
@@ -550,5 +686,103 @@ mod tests {
             assert!(ensure_not_reserved(name).is_err(), "{name} must be refused");
         }
         assert!(ensure_not_reserved("X-Request-Id").is_ok());
+    }
+
+    #[test]
+    fn a_rate_limit_backs_off_past_the_servers_one_minute_window() {
+        // Three attempts have to add up to something the fixed window can
+        // actually roll over within; the old 500ms base spent them in 3.5s.
+        let total: Duration = (0..MAX_RETRIES).map(|a| retry_delay(429, a, None)).sum();
+        assert!(
+            total >= Duration::from_secs(30),
+            "429 backoff totals only {total:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_retryable_statuses_keep_the_short_backoff() {
+        assert_eq!(retry_delay(503, 0, None), INITIAL_BACKOFF);
+        assert_eq!(retry_delay(503, 1, None), INITIAL_BACKOFF * 2);
+        // A 503 is transient, not windowed — a `Retry-After` there is not ours
+        // to honour through the rate-limit path.
+        assert_eq!(
+            retry_delay(503, 0, Some(Duration::from_secs(90))),
+            INITIAL_BACKOFF
+        );
+    }
+
+    #[test]
+    fn a_retry_after_header_wins_over_our_guess() {
+        assert_eq!(
+            retry_delay(429, 0, Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+    }
+
+    /// The client is the last gate, so it has to hold even for a path that
+    /// every earlier check somehow let through. These never reach the network:
+    /// resolution happens before the first attempt is sent.
+    #[tokio::test]
+    async fn the_client_refuses_a_path_that_would_leave_the_origin() {
+        let client =
+            HttpClient::new("https://api.ilert.com", Some("super-secret".into()), None).unwrap();
+
+        for path in [
+            "//evil.example/steal",
+            "/\\evil.example/steal",
+            "https://evil.example/steal",
+            "api/alerts",
+            "/api/al\rerts",
+            "/api/alerts#/../..",
+            "",
+        ] {
+            let err = client
+                .request(Method::GET, path, &[], &[], None)
+                .await
+                .expect_err("{path} must be refused");
+            assert!(
+                err.to_string().contains("Refusing"),
+                "{path}: unexpected error {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_client_keeps_a_request_inside_a_base_path_prefix() {
+        let client = HttpClient::new("https://gateway.example.com/ilert", None, None).unwrap();
+        let err = client
+            .request(Method::GET, "/../secret", &[], &[], None)
+            .await
+            .expect_err("traversal out of the prefix must be refused");
+        assert!(err.to_string().contains("outside the base URL"), "{err}");
+    }
+
+    #[test]
+    fn a_base_url_that_cannot_be_trusted_is_refused_at_construction() {
+        for base in [
+            "https://user:pass@api.ilert.com",
+            "https://api.ilert.com?tenant=1",
+            "https://api.ilert.com#frag",
+            "ftp://api.ilert.com",
+            "not a url",
+        ] {
+            assert!(
+                HttpClient::new(base, None, None).is_err(),
+                "{base} must not build a client"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_is_read_only_in_delta_seconds_form() {
+        let with = |value: &str| HttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".to_string(), value.to_string())],
+            body: ResponseBody::json(Value::Null),
+        };
+        assert_eq!(retry_after(&with("30")), Some(Duration::from_secs(30)));
+        assert_eq!(retry_after(&with(" 30 ")), Some(Duration::from_secs(30)));
+        // An HTTP-date is deliberately not parsed.
+        assert_eq!(retry_after(&with("Wed, 21 Oct 2015 07:28:00 GMT")), None);
     }
 }

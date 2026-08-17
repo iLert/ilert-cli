@@ -12,6 +12,44 @@ use crate::preview::{OperationRef, RequestPreview};
 const DEFAULT_PAGE_SIZE: u64 = 50;
 const MAX_PAGES: u64 = 200;
 
+/// Spacing between page requests.
+///
+/// A page every 500 ms is 120 calls a minute, which fits inside the default REST
+/// allowance — the fastest a long export can go without rate-limiting itself
+/// under it. The previous 200 ms ran at 300 calls a minute and tripped the
+/// limiter partway through.
+///
+/// An account whose allowance is lower will still hit `429` at this pace; that is
+/// what the rate-limit backoff in `http.rs` is for, and pacing for the smallest
+/// limit anyone might have would slow every ordinary export down for nothing.
+const PAGE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The page size a `400` is complaining about, if that is what it is complaining
+/// about.
+///
+/// The server rejects an oversized `max-results` with the ceiling in the message
+/// — `'max-results' must not be above 20` — and that is the only machine-readable
+/// statement of the caps that are not in the schema. Matching on it is a
+/// best-effort recovery: an unrecognised message just falls through to the error
+/// the caller would have got anyway.
+fn cap_from_rejection(err: &anyhow::Error) -> Option<u64> {
+    let CliError::Http {
+        status, message, ..
+    } = err.downcast_ref::<CliError>()?
+    else {
+        return None;
+    };
+    if *status != 400 || !message.contains("max-results") {
+        return None;
+    }
+    let (_, rest) = message.split_once("must not be above")?;
+    rest.trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// How this operation is named back to the caller in a preview or refusal.
 pub fn operation_ref(operation: &Operation) -> OperationRef {
     OperationRef::new(format!("{} {}", operation.tag, operation.action))
@@ -150,14 +188,37 @@ impl<'a> OperationRunner<'a> {
             .parse()
             .map_err(|_| CliError::user(format!("Invalid HTTP method: {}", operation.method)))?;
 
-        let page_size = args
-            .get_one::<String>("max-results")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE);
+        // `try_get_one` rather than `get_one`: `--all` is only offered where the
+        // spec declares both paging parameters, so these are defined — but the
+        // panicking accessor turns any future mismatch into a crash instead of
+        // an error, and this is the code path that already suffered that once.
+        let requested_page_size = args
+            .try_get_one::<String>("max-results")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let mut page_size = match (requested_page_size, operation.max_results_cap()) {
+            (Some(requested), Some(cap)) if requested > cap => {
+                eprintln!(
+                    "{} --max-results {} exceeds this endpoint's limit of {}. Using {}.",
+                    "Warning:".yellow().bold(),
+                    requested,
+                    cap,
+                    cap
+                );
+                cap
+            }
+            (Some(requested), _) => requested,
+            (None, Some(cap)) => DEFAULT_PAGE_SIZE.min(cap),
+            (None, None) => DEFAULT_PAGE_SIZE,
+        };
 
         let mut all_items: Vec<Value> = Vec::new();
         let mut start_index: u64 = args
-            .get_one::<String>("start-index")
+            .try_get_one::<String>("start-index")
+            .ok()
+            .flatten()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
@@ -177,7 +238,7 @@ impl<'a> OperationRunner<'a> {
             upsert_query(&mut query, "start-index", &start_index.to_string());
             upsert_query(&mut query, "max-results", &page_size.to_string());
 
-            let (_, body) = self
+            let result = self
                 .client
                 .request(
                     method.clone(),
@@ -186,7 +247,25 @@ impl<'a> OperationRunner<'a> {
                     &req.headers,
                     req.body.clone(),
                 )
-                .await?;
+                .await;
+
+            let body = match result {
+                Ok((_, body)) => body,
+                // Not every cap is in the schema: `?include=` lowers it further,
+                // and the spec states that only in prose. The server names the
+                // real limit in the rejection, so take it and re-page rather
+                // than failing an export over an off-by-a-few page size.
+                Err(e) => match cap_from_rejection(&e).filter(|cap| *cap < page_size) {
+                    Some(cap) => {
+                        page_size = cap;
+                        continue;
+                    }
+                    None => {
+                        spinner.finish_and_clear();
+                        return Err(e);
+                    }
+                },
+            };
 
             let items = extract_page_items(body.value());
             let count = items.len() as u64;
@@ -212,8 +291,7 @@ impl<'a> OperationRunner<'a> {
 
             start_index += count;
 
-            // Rate-limit: 200ms between page requests
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(PAGE_INTERVAL).await;
         }
 
         spinner.finish_and_clear();
@@ -601,5 +679,42 @@ mod tests {
         let err = path_segment("user-id", "../admin").unwrap_err().to_string();
         assert!(err.contains("user-id"));
         assert!(err.contains("../admin"));
+    }
+
+    fn rejection(status: u16, message: &str) -> anyhow::Error {
+        CliError::Http {
+            status,
+            message: message.to_string(),
+            details: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn an_oversized_page_rejection_yields_the_servers_own_cap() {
+        assert_eq!(
+            cap_from_rejection(&rejection(400, "'max-results' must not be above 20")),
+            Some(20)
+        );
+        // The `include` variant, whose cap appears in no schema.
+        assert_eq!(
+            cap_from_rejection(&rejection(
+                400,
+                "'max-results' must not be above 25, when using 'include'"
+            )),
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn other_failures_are_not_mistaken_for_a_page_cap() {
+        for err in [
+            rejection(400, "'start-index' must not be negative"),
+            rejection(404, "'max-results' must not be above 20"),
+            rejection(400, "max-results is wrong somehow"),
+        ] {
+            assert!(cap_from_rejection(&err).is_none(), "{err}");
+        }
+        assert!(cap_from_rejection(&CliError::user("nope").into()).is_none());
     }
 }

@@ -103,6 +103,49 @@ impl Classification {
     }
 }
 
+/// Methods whose destructiveness the spec does not get a vote on.
+///
+/// `DELETE` says what it does, and a method we have never heard of could do
+/// anything. Both are [`Classification::from_method`] destructive, and
+/// [`clamp_to_method_floor`] will not let a document argue otherwise — see the
+/// note there for why.
+fn destructive_regardless_of_the_spec(method: &str) -> bool {
+    !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH"
+    )
+}
+
+/// Raise a classification back to what the HTTP method itself guarantees.
+///
+/// This has to run **last**, after every input that can lower the guard. Both
+/// of those inputs are addressed by something the spec chooses: the extension
+/// is read out of the operation object, and [`OPERATION_OVERRIDES`] is matched
+/// on `operationId` alone. The ilert spec declares no `operationId`, so ours
+/// are synthesized from method and path — but nothing stops a document from
+/// declaring one, and a `DELETE` that names itself `post-incidents-publish-info`
+/// would otherwise inherit that entry's `read_only` and skip confirmation
+/// entirely. The method is the one part of an operation we do not take on trust,
+/// so it gets the last word.
+///
+/// Idempotence is left alone: it says whether a retry is safe, not whether to
+/// ask, and both answers are defensible for a `DELETE`.
+fn clamp_to_method_floor(method: &str, requested: Classification) -> Classification {
+    if !destructive_regardless_of_the_spec(method) {
+        return requested;
+    }
+
+    Classification {
+        // `read_only` is clamped alongside `destructive` rather than left to
+        // fail the consistency check: a clamp that turns into a hard error is
+        // just a slower way for a spec to break the CLI, and "this DELETE is a
+        // read" is not a claim worth preserving in order to reject it.
+        read_only: false,
+        destructive: true,
+        idempotent: requested.idempotent,
+    }
+}
+
 /// Apply an `x-ilert-cli-classification` extension on top of a base
 /// classification. Every field is optional, so a spec can flip a single
 /// property without restating the rest.
@@ -110,10 +153,25 @@ impl Classification {
 /// ```json
 /// "x-ilert-cli-classification": { "destructive": true }
 /// ```
-pub fn apply_extension(base: Classification, op_value: &Value) -> Classification {
-    let ext = match op_value.get(EXTENSION_KEY).and_then(|v| v.as_object()) {
-        Some(obj) => obj,
-        None => return base,
+///
+/// # What a spec may not do
+///
+/// The extension may raise the guard on an operation and it may lower it on a
+/// `POST`/`PUT`/`PATCH` — that is the whole point of it, and those already go
+/// through without confirmation by default, so nothing is given away.
+///
+/// It may **not** clear `destructive` on a `DELETE` or on a method we do not
+/// recognise. The spec arrives over the network from the same host the request
+/// would go to, so treating it as authority over the confirmation gate means
+/// `"x-ilert-cli-classification": {"destructive": false, "readOnly": true}` on
+/// `DELETE /alerts/{id}` turns `--yes` off for deletions and makes the preview
+/// describe them as reads. A document cannot be allowed to disarm the check
+/// that exists to protect the caller from it. Downgrades of that kind are
+/// clamped silently rather than raised as an error: this runs while the command
+/// tree is being built, and a spec bug should not stop the CLI from starting.
+pub fn apply_extension(method: &str, base: Classification, op_value: &Value) -> Classification {
+    let Some(ext) = op_value.get(EXTENSION_KEY).and_then(|v| v.as_object()) else {
+        return base;
     };
 
     let field = |camel: &str, snake: &str, current: bool| -> bool {
@@ -123,11 +181,14 @@ pub fn apply_extension(base: Classification, op_value: &Value) -> Classification
             .unwrap_or(current)
     };
 
-    Classification {
-        read_only: field("readOnly", "read_only", base.read_only),
-        destructive: field("destructive", "destructive", base.destructive),
-        idempotent: field("idempotent", "idempotent", base.idempotent),
-    }
+    clamp_to_method_floor(
+        method,
+        Classification {
+            read_only: field("readOnly", "read_only", base.read_only),
+            destructive: field("destructive", "destructive", base.destructive),
+            idempotent: field("idempotent", "idempotent", base.idempotent),
+        },
+    )
 }
 
 pub const EXTENSION_KEY: &str = "x-ilert-cli-classification";
@@ -213,12 +274,16 @@ pub fn resolve_with(
     op_value: &Value,
     overrides: &[(&str, Classification)],
 ) -> Result<Classification> {
-    let base = apply_extension(Classification::from_method(method), op_value);
+    let base = apply_extension(method, Classification::from_method(method), op_value);
     let resolved = overrides
         .iter()
         .find(|(id, _)| *id == operation_id)
         .map(|(_, c)| *c)
         .unwrap_or(base);
+    // Reapplied after the override lookup, not just inside `apply_extension`:
+    // the table is keyed on `operationId` with no regard for the method, so a
+    // spec that picks the right id can borrow a read-only entry for a DELETE.
+    let resolved = clamp_to_method_floor(method, resolved);
 
     if !resolved.is_consistent() {
         return Err(CliError::user(format!(
@@ -348,6 +413,82 @@ mod tests {
         assert!(!resolved.idempotent);
     }
 
+    /// The spec comes from the network. It may tighten the gate, never open it
+    /// on the two methods whose danger is not the spec's to reinterpret.
+    #[test]
+    fn a_spec_cannot_talk_us_out_of_confirming_a_delete() {
+        let disarm = json!({
+            "x-ilert-cli-classification": { "destructive": false, "readOnly": true },
+        });
+
+        for method in ["DELETE", "delete", "PURGE", "TRUNCATE", "wipe"] {
+            let c = for_operation(method, "someOp", &disarm).unwrap();
+            assert!(c.destructive, "{method} lost its confirmation gate");
+            assert!(!c.read_only, "{method} was relabelled as a read");
+        }
+    }
+
+    /// The override table is looked up by `operationId` alone, so a document
+    /// that names a `DELETE` after a known read-only operation would otherwise
+    /// inherit that entry and skip the prompt. The floor is reapplied after the
+    /// lookup, not only inside `apply_extension`.
+    #[test]
+    fn a_delete_cannot_borrow_a_read_only_operation_id() {
+        // Every read-only entry we ship is a live key for this attack.
+        let read_only_ids: Vec<&str> = OPERATION_OVERRIDES
+            .iter()
+            .filter(|(_, c)| c.read_only)
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(!read_only_ids.is_empty(), "test needs a read-only entry");
+
+        for id in read_only_ids {
+            for method in ["DELETE", "delete", "PURGE"] {
+                let c = for_operation(method, id, &json!({})).unwrap();
+                assert!(c.destructive, "{method} {id} lost its confirmation gate");
+                assert!(!c.read_only, "{method} {id} was relabelled as a read");
+            }
+            // The entry still applies to the method it was written for.
+            let (write_method, _) = id.split_once('-').unwrap();
+            let c = for_operation(write_method, id, &json!({})).unwrap();
+            assert!(
+                c.read_only,
+                "{id} lost its own override under {write_method}"
+            );
+        }
+    }
+
+    /// The other direction still works: a write the spec knows to be harmless
+    /// stays unconfirmed, and one it knows to be dangerous gains the gate.
+    #[test]
+    fn a_spec_may_still_classify_the_methods_it_owns() {
+        let relax = json!({ "x-ilert-cli-classification": { "readOnly": true } });
+        for method in ["POST", "PUT", "PATCH"] {
+            let c = for_operation(method, "searchOp", &relax).unwrap();
+            assert!(c.read_only, "{method} should be allowed to declare a read");
+            assert!(!c.destructive);
+        }
+
+        let tighten = json!({ "x-ilert-cli-classification": { "destructive": true } });
+        assert!(
+            for_operation("POST", "purgeOp", &tighten)
+                .unwrap()
+                .destructive
+        );
+    }
+
+    /// A clamped `DELETE` keeps whatever the spec said about retry safety —
+    /// only the two fields the gate reads are pinned.
+    #[test]
+    fn clamping_a_delete_leaves_idempotence_to_the_spec() {
+        let op = json!({
+            "x-ilert-cli-classification": { "destructive": false, "idempotent": false },
+        });
+        let c = for_operation("DELETE", "someOp", &op).unwrap();
+        assert!(c.destructive);
+        assert!(!c.idempotent);
+    }
+
     #[test]
     fn extension_accepts_snake_case_too() {
         let op = json!({ "x-ilert-cli-classification": { "read_only": false } });
@@ -399,7 +540,13 @@ mod tests {
 
         // ...and via an override.
         let table: &[(&str, Classification)] = &[("bad", Classification::new(true, true, true))];
-        assert!(resolve_with("DELETE", "bad", &json!({}), table).is_err());
+        assert!(resolve_with("POST", "bad", &json!({}), table).is_err());
+
+        // For a DELETE the same entry is clamped instead of rejected — the
+        // method floor runs first and settles the contradiction on the safe
+        // side, which beats refusing to build the command tree at all.
+        let clamped = resolve_with("DELETE", "bad", &json!({}), table).unwrap();
+        assert_eq!(clamped, Classification::new(false, true, true));
     }
 
     #[test]

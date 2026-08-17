@@ -153,17 +153,23 @@ async fn refresh_data(client: &HttpClient, state: &mut DashboardState) {
 
     state.last_error = None;
 
+    // The message half of these comes off the wire, and it lands in the status
+    // bar unquoted.
+    let failure = |label: &str, e: anyhow::Error| {
+        Some(crate::sanitize::terminal_string(format!("{label}: {e}")))
+    };
+
     match alerts_res {
         Ok((_, body)) => state.alerts = extract_items(body.value()),
-        Err(e) => state.last_error = Some(format!("Alerts: {e}")),
+        Err(e) => state.last_error = failure("Alerts", e),
     }
     match incidents_res {
         Ok((_, body)) => state.incidents = extract_items(body.value()),
-        Err(e) => state.last_error = Some(format!("Incidents: {e}")),
+        Err(e) => state.last_error = failure("Incidents", e),
     }
     match services_res {
         Ok((_, body)) => state.services = extract_items(body.value()),
-        Err(e) => state.last_error = Some(format!("Services: {e}")),
+        Err(e) => state.last_error = failure("Services", e),
     }
 }
 
@@ -267,10 +273,8 @@ fn draw_alerts(f: &mut Frame, area: Rect, state: &DashboardState) {
             let priority = field_str(a, "priority");
             let source = a
                 .get("alertSource")
-                .and_then(|s| s.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
+                .map(|s| field_str(s, "name"))
+                .unwrap_or_default();
 
             let style = match status.as_str() {
                 "PENDING" => Style::default().fg(Color::Yellow),
@@ -398,19 +402,34 @@ fn draw_services(f: &mut Frame, area: Rect, state: &DashboardState) {
     f.render_widget(table, area);
 }
 
+/// One field of an API object, ready to put in a cell.
+///
+/// Escaped here rather than at each call site because every string the
+/// dashboard shows arrives this way. ratatui writes cell contents into the
+/// terminal as-is, so an alert summary carrying `ESC [ 2J` would clear the
+/// screen underneath the frame it is being drawn into, and a bidi override
+/// would reorder a service name without changing it.
 fn field_str(value: &Value, key: &str) -> String {
-    match value.get(key) {
+    let raw = match value.get(key) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
+        _ => return String::new(),
+    };
+    crate::sanitize::terminal_string(raw)
 }
 
+/// Truncate to `max` characters.
+///
+/// Counted in `char`s, not bytes: a summary with an umlaut in it made the old
+/// byte slice land mid-codepoint and panic, which in raw mode leaves the
+/// terminal in the alternate screen with echo off.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
+    if s.chars().count() <= max {
+        return s.to_string();
     }
+    let keep = max.saturating_sub(3);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push_str("...");
+    out
 }

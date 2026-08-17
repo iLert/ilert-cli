@@ -320,13 +320,11 @@ impl Cli {
         } else {
             config.resolve_credential_opt().await?
         };
-        Ok(HttpClient::new(
-            config.base_url.clone(),
-            api_key,
-            config.team_context.clone(),
+        Ok(
+            HttpClient::new(&config.base_url, api_key, config.team_context.clone())?
+                .with_debug(ctx.log_level >= LogLevel::Debug)
+                .with_extra_headers(ctx.headers.clone()),
         )
-        .with_debug(ctx.log_level >= LogLevel::Debug)
-        .with_extra_headers(ctx.headers.clone()))
     }
 
     /// The request as the caller will see it in a preview or refusal, including
@@ -460,9 +458,14 @@ impl Cli {
                         ));
                     }
                     Err(e) => {
+                        // Printed here instead of returned, so it does not get
+                        // `print_error`'s escaping for free. The messages this
+                        // can carry are all locally built today, but that is a
+                        // property of `ensure_spec`, not of this line.
                         ctx.info(&format!(
-                            "{} Could not fetch API spec: {e}",
-                            "Warning:".yellow().bold()
+                            "{} Could not fetch API spec: {}",
+                            "Warning:".yellow().bold(),
+                            crate::sanitize::terminal_string(e.to_string())
                         ));
                     }
                 }
@@ -1150,10 +1153,18 @@ impl Cli {
             // Every line picks its own path, so each one has to be proven to be
             // a single segment before it is substituted — the preview the
             // caller confirmed described the template, not this value.
+            // These two arms report per line and carry on, so neither reaches
+            // `output::print_error` — they have to escape for themselves. The
+            // refusal quotes the piped line back, and the request error quotes
+            // the message the server wrote.
             let segment = match crate::runner::path_segment("id", &id) {
                 Ok(segment) => segment,
                 Err(e) => {
-                    eprintln!("{} {e}", "Error:".red().bold());
+                    eprintln!(
+                        "{} {}",
+                        "Error:".red().bold(),
+                        crate::sanitize::terminal_string(e.to_string())
+                    );
                     continue;
                 }
             };
@@ -1175,7 +1186,12 @@ impl Cli {
             {
                 Ok((_, body)) => results.push(body.into_value()),
                 Err(e) => {
-                    eprintln!("{} {id}: {e}", "Error:".red().bold());
+                    eprintln!(
+                        "{} {}: {}",
+                        "Error:".red().bold(),
+                        crate::sanitize::terminal_text(&id),
+                        crate::sanitize::terminal_string(e.to_string())
+                    );
                 }
             }
         }
@@ -1443,13 +1459,23 @@ fn attach_dynamic_commands(mut app: Command, index: &OperationIndex) -> Command 
     app
 }
 
+/// `--help` is the one screen that renders untrusted text without anything else
+/// framing it, and every string on it below the root comes out of the OpenAPI
+/// document: summaries, descriptions, parameter help. They are escaped here,
+/// where they become display text, rather than in `openapi.rs` — `ops show`
+/// emits the same fields as JSON for a machine to read, and that contract says
+/// verbatim.
+fn help_text(raw: &str) -> String {
+    crate::sanitize::terminal_text(raw)
+}
+
 fn build_operation_command(op: &Operation) -> Command {
     let fallback = format!("{} {}", op.method, op.path);
     let about = op.summary.as_deref().unwrap_or(&fallback);
 
     let mut cmd = Command::new(op.action.clone())
-        .about(about.to_string())
-        .long_about(op.description.clone().unwrap_or_default());
+        .about(help_text(about))
+        .long_about(help_text(op.description.as_deref().unwrap_or_default()));
 
     // `--stdin` supplies the ID for every request it makes, so demanding `--id`
     // as well would be asking for a value that is about to be ignored.
@@ -1469,7 +1495,7 @@ fn build_operation_command(op: &Operation) -> Command {
             .long(param.name.clone())
             .value_name(param_value_name(param));
         if let Some(ref desc) = param.description {
-            arg = arg.help(desc.clone());
+            arg = arg.help(help_text(desc));
         }
         match param.location {
             ParamLocation::Path if takes_stdin && stdin_substitutes(&param.name) => {
@@ -1503,19 +1529,24 @@ fn build_operation_command(op: &Operation) -> Command {
     }
 
     if op.action == "list" || (op.method == "GET" && !op.path.ends_with('}')) {
-        cmd = cmd
-            .arg(
+        // `--all` is offered only where the spec says it can work. Offering it
+        // on a collection that declares no paging parameters used to hand the
+        // pagination loop an argument clap had never defined, which is a panic
+        // rather than an error.
+        if op.supports_offset_pagination() {
+            cmd = cmd.arg(
                 Arg::new("all")
                     .long("all")
                     .action(ArgAction::SetTrue)
                     .help("Fetch all pages automatically"),
-            )
-            .arg(
-                Arg::new("watch")
-                    .long("watch")
-                    .value_name("SECS")
-                    .help("Re-fetch every N seconds (default: 5)"),
             );
+        }
+        cmd = cmd.arg(
+            Arg::new("watch")
+                .long("watch")
+                .value_name("SECS")
+                .help("Re-fetch every N seconds (default: 5)"),
+        );
     }
 
     // Pipe support for get/delete/update operations that take an ID

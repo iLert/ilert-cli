@@ -331,10 +331,18 @@ pub fn parse_global_headers(matches: &ArgMatches) -> Result<Vec<(String, String)
 }
 
 /// `--include`: the status line and response headers, ahead of the body.
+///
+/// Header values are server-controlled and printed one per line, so an escape
+/// or a `\r` in one could forge a header that was never sent — or, with OSC 52,
+/// leave something in the user's clipboard.
 pub fn print_response_meta(status: u16, headers: &[(String, String)]) {
     println!("HTTP {status}");
     for (name, value) in headers {
-        println!("{name}: {value}");
+        println!(
+            "{}: {}",
+            crate::sanitize::terminal_text(name),
+            crate::sanitize::terminal_text(value)
+        );
     }
     println!();
 }

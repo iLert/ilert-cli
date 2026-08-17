@@ -7,9 +7,23 @@ use serde_json::Value;
 
 use crate::classification::{self, Classification};
 use crate::config::ConfigManager;
+use crate::endpoint::{Endpoint, validate_spec_path};
 use crate::errors::CliError;
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The spec fetch gets its own budget rather than inheriting reqwest's default
+/// of none: it runs before the command tree exists, so a server that accepts
+/// the connection and then stalls would hang the CLI with nothing on screen.
+const SPEC_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much of a spec we are willing to read.
+///
+/// The real document is around a megabyte. This is a bound on what a hostile or
+/// broken endpoint can make us buffer — the body is decoded into memory and
+/// then parsed into a `Value`, so an unbounded response is an unbounded
+/// allocation. Generous enough that growth in the API cannot trip it.
+const MAX_SPEC_BYTES: usize = 32 * 1024 * 1024;
 
 /// The single cache file used before specs were kept per environment. Removed
 /// opportunistically on the next write so an upgrade does not strand it.
@@ -34,6 +48,46 @@ pub struct Operation {
     /// How dangerous this operation is. Resolved once, here, so the
     /// confirmation flow never has to guess from a method string.
     pub classification: Classification,
+}
+
+/// The query parameters that drive offset pagination. Both have to be present:
+/// `--all` walks pages by rewriting them, so an operation carrying only one of
+/// the two cannot be paged that way.
+const OFFSET_PAGE_PARAMS: [&str; 2] = ["start-index", "max-results"];
+
+impl Operation {
+    pub fn query_param(&self, name: &str) -> Option<&Parameter> {
+        self.parameters
+            .iter()
+            .find(|p| p.location == ParamLocation::Query && p.name == name)
+    }
+
+    /// Whether `--all` can actually walk this operation.
+    ///
+    /// Decided from the spec rather than from the shape of the path: most
+    /// collection GETs page by offset, but a handful (`/alerts/count`,
+    /// `/numbers`, the `/reports/*` endpoints, every `/users/{id}/contacts/*`
+    /// list) return the whole set at once and declare neither parameter, and
+    /// `/heartbeat-monitors` pages by `cursor` instead.
+    pub fn supports_offset_pagination(&self) -> bool {
+        OFFSET_PAGE_PARAMS
+            .iter()
+            .all(|name| self.query_param(name).is_some())
+    }
+
+    /// The server's own ceiling on `max-results`, when the spec states one.
+    ///
+    /// Caps differ per endpoint (20 on `/schedules`, 50 on `/status-pages`, 100
+    /// on `/alerts`, 200 on `/heartbeat-monitors`) and overshooting is rejected
+    /// with a `400` rather than clamped, so a fixed page size cannot be right
+    /// everywhere.
+    pub fn max_results_cap(&self) -> Option<u64> {
+        self.query_param("max-results")?
+            .schema
+            .as_ref()?
+            .get("maximum")?
+            .as_u64()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +140,10 @@ pub fn load_cached_index(base_url: &str) -> Result<Option<OperationIndex>> {
 /// Ensure we have a fresh spec. Fetches if missing or stale, returns the index.
 pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
     let cache_path = cache_file_path(base_url)?;
-    let spec_url = format!("{}/api-docs/openapi.json", base_url.trim_end_matches('/'));
+    // Resolved through the same gate as every other request rather than
+    // concatenated: the spec decides which commands exist, so fetching it from
+    // the wrong origin is worse than sending one request there.
+    let spec_url = Endpoint::parse(base_url)?.resolve("/api-docs/openapi.json")?;
 
     // Try cache first
     if let Some(cached) = load_from_cache(&cache_path)? {
@@ -111,11 +168,64 @@ pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
     build_index(&spec)
 }
 
-async fn fetch_spec(url: &str) -> Result<Value> {
-    let client = crate::client::builder().build()?;
-    let resp = client.get(url).send().await?;
-    let spec: Value = resp.json().await?;
-    Ok(spec)
+/// Fetch and parse the OpenAPI document.
+///
+/// Unlike an API call this one is unauthenticated, but it is not low-stakes:
+/// the document it returns becomes the command tree, the request paths and the
+/// destructive/read-only classification of everything the CLI can do. So it is
+/// fetched under the same rules as the rest — no redirects (a 302 would let the
+/// endpoint hand spec authority to a host the profile never named), a timeout,
+/// an explicit status check, and a ceiling on how much we will read.
+pub(crate) async fn fetch_spec(url: &url::Url) -> Result<Value> {
+    let client = crate::client::builder()
+        .timeout(SPEC_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let mut response = client.get(url.clone()).send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // Report the redirect rather than letting it look like a server error:
+        // "the spec moved" is a different problem from "the spec is broken".
+        let hint = if status.is_redirection() {
+            " (redirects are not followed for the API spec)"
+        } else {
+            ""
+        };
+        return Err(CliError::user(format!(
+            "Failed to fetch the API spec from {url}: HTTP {}{hint}.",
+            status.as_u16()
+        ))
+        .into());
+    }
+
+    // `Content-Length` is a hint, not a promise, so it is used to fail early
+    // and the running total below is what actually enforces the limit.
+    if let Some(declared) = response.content_length()
+        && declared > MAX_SPEC_BYTES as u64
+    {
+        return Err(spec_too_large(url));
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_SPEC_BYTES {
+            return Err(spec_too_large(url));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body)
+        .map_err(|e| CliError::user(format!("The API spec at {url} is not valid JSON: {e}")).into())
+}
+
+fn spec_too_large(url: &url::Url) -> anyhow::Error {
+    CliError::user(format!(
+        "The API spec at {url} is larger than the {} MiB limit; refusing to read it.",
+        MAX_SPEC_BYTES / (1024 * 1024)
+    ))
+    .into()
 }
 
 /// Where the spec served by `base_url` is cached.
@@ -124,7 +234,7 @@ async fn fetch_spec(url: &str) -> Result<Value> {
 /// what they classify as, so serving a staging spec to a production profile
 /// (or the reverse) just because it was fetched more recently would be wrong in
 /// a way that is invisible at the call site.
-fn cache_file_path(base_url: &str) -> Result<PathBuf> {
+pub(crate) fn cache_file_path(base_url: &str) -> Result<PathBuf> {
     let cache_dir = ConfigManager::cache_dir()?;
     Ok(cache_dir.join(format!("openapi-{}.json", cache_key(base_url))))
 }
@@ -182,7 +292,7 @@ fn is_cache_stale(path: &PathBuf) -> Result<bool> {
     Ok(age > CACHE_TTL)
 }
 
-fn save_to_cache(path: &PathBuf, spec: &Value) -> Result<()> {
+pub(crate) fn save_to_cache(path: &PathBuf, spec: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         // Nothing reads the pre-per-environment file any more; drop it rather
@@ -219,12 +329,47 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
         })
         .unwrap_or("");
 
+    // `servers[0].url` is prepended to every path, so a hostile one poisons the
+    // whole document at once — `"//evil.example"` would turn each path into a
+    // scheme-relative URL. Checked on its own so the failure is reported once
+    // and names the real culprit, instead of once per path.
+    let server_base = match crate::endpoint::validate_request_path(server_base) {
+        _ if server_base.is_empty() => "",
+        Ok(()) => server_base,
+        Err(e) => {
+            // The warning quotes the very string that failed validation, which
+            // is the string most likely to be hostile — a rejected path that
+            // clears the screen on its way to being reported would hide the
+            // report.
+            eprintln!(
+                "Warning: ignoring API spec server base path '{}': {}",
+                crate::sanitize::terminal_text(server_base),
+                crate::sanitize::terminal_string(e.to_string())
+            );
+            ""
+        }
+    };
+
     let mut by_id: HashMap<String, Operation> = HashMap::new();
     let mut by_tag: HashMap<String, Vec<Operation>> = HashMap::new();
     let mut action_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
     for (path, methods) in paths {
         let full_path = format!("{server_base}{path}");
+        // Checked here so a path that could re-target a request never becomes a
+        // command at all — `ilert alerts list` cannot be made to send the
+        // caller's token to `//evil.example` if the operation does not exist.
+        // Dropped rather than fatal: one malformed key in a spec we did not
+        // write should not take the whole CLI down with it, and
+        // `HttpClient::request_raw` refuses the same path again anyway.
+        if let Err(e) = validate_spec_path(&full_path) {
+            eprintln!(
+                "Warning: ignoring API spec path '{}': {}",
+                crate::sanitize::terminal_text(path),
+                crate::sanitize::terminal_string(e.to_string())
+            );
+            continue;
+        }
         let methods = match methods.as_object() {
             Some(m) => m,
             None => continue,
@@ -338,8 +483,15 @@ fn derive_action(method: &str, path: &str) -> String {
     }
 }
 
+/// A spec `tag` as the CLI names it: a command, an index key and a line of
+/// `--help`, all at once.
+///
+/// Sanitized here rather than where it is printed so all three agree. Escaping
+/// only at print time would leave `index.by_tag` keyed by a string carrying an
+/// escape sequence while the command was named by the escaped one, and dispatch
+/// would stop finding it.
 fn normalize_tag(tag: &str) -> String {
-    tag.to_lowercase().replace([' ', '_'], "-")
+    crate::sanitize::terminal_string(tag.to_lowercase().replace([' ', '_'], "-"))
 }
 
 /// The identity an operation is known by: its `operationId` when the spec
@@ -363,12 +515,14 @@ fn slugify_path(path: &str) -> String {
         .replace(['{', '}'], "")
 }
 
+/// The tail segment a colliding action is disambiguated by. Part of a command
+/// name, so it is escaped for the same reason [`normalize_tag`] is.
 fn path_suffix(path: &str) -> String {
     let segments: Vec<&str> = path
         .split('/')
         .filter(|s| !s.is_empty() && !s.starts_with('{'))
         .collect();
-    segments.last().unwrap_or(&"unknown").to_lowercase()
+    crate::sanitize::terminal_string(segments.last().unwrap_or(&"unknown").to_lowercase())
 }
 
 fn extract_parameters(op: &Value) -> Vec<Parameter> {
@@ -380,7 +534,10 @@ fn extract_parameters(op: &Value) -> Vec<Parameter> {
     params
         .iter()
         .filter_map(|p| {
-            let name = p.get("name")?.as_str()?.to_string();
+            // A parameter name becomes a `--flag`, a lookup key in
+            // `RequestParams::from_operation`, and a query-string key on the
+            // wire. Escaping it here keeps all three the same string.
+            let name = crate::sanitize::terminal_text(p.get("name")?.as_str()?);
             let location = match p.get("in")?.as_str()? {
                 "path" => ParamLocation::Path,
                 "query" => ParamLocation::Query,
@@ -526,5 +683,71 @@ mod tests {
             cache_key(&format!("{prefix}/alpha")),
             cache_key(&format!("{prefix}/beta"))
         );
+    }
+
+    mod pagination {
+        use crate::openapi::{Classification, Operation, ParamLocation, Parameter};
+
+        fn query_param(name: &str, schema: Option<serde_json::Value>) -> Parameter {
+            Parameter {
+                name: name.to_string(),
+                location: ParamLocation::Query,
+                required: false,
+                description: None,
+                schema,
+            }
+        }
+
+        fn operation(parameters: Vec<Parameter>) -> Operation {
+            Operation {
+                id: "get-things".into(),
+                method: "GET".into(),
+                path: "/things".into(),
+                summary: None,
+                description: None,
+                tag: "things".into(),
+                action: "list".into(),
+                parameters,
+                request_body_schema: None,
+                has_request_body: false,
+                request_body_required: false,
+                classification: Classification::from_method("GET"),
+            }
+        }
+
+        #[test]
+        fn offset_paging_needs_both_parameters() {
+            let both = operation(vec![
+                query_param("start-index", None),
+                query_param("max-results", None),
+            ]);
+            assert!(both.supports_offset_pagination());
+
+            // `/heartbeat-monitors` pages by cursor: max-results, no start-index.
+            let cursor = operation(vec![
+                query_param("max-results", None),
+                query_param("cursor", None),
+            ]);
+            assert!(!cursor.supports_offset_pagination());
+
+            // `/numbers`, `/reports/*` and friends declare neither.
+            assert!(!operation(vec![]).supports_offset_pagination());
+        }
+
+        #[test]
+        fn a_declared_maximum_is_the_page_cap() {
+            let capped = operation(vec![query_param(
+                "max-results",
+                Some(serde_json::json!({"default": 20, "maximum": 20})),
+            )]);
+            assert_eq!(capped.max_results_cap(), Some(20));
+
+            let uncapped = operation(vec![query_param(
+                "max-results",
+                Some(serde_json::json!({"default": 50})),
+            )]);
+            assert_eq!(uncapped.max_results_cap(), None);
+            assert_eq!(operation(vec![]).max_results_cap(), None);
+        }
     }
 }
