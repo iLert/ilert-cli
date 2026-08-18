@@ -1442,7 +1442,10 @@ async fn version_command_shows_version() {
         .args(["version"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ilert 0.1.0"));
+        .stdout(predicate::str::contains(format!(
+            "ilert {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1533,32 @@ async fn on_call_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("on call"));
+}
+
+#[tokio::test]
+async fn on_call_now_expands_the_entities_it_prints() {
+    let h = TestHarness::start().await;
+
+    // Unexpanded, the API answers with bare `{"id": …}` references and every
+    // line renders as "Unknown (Unknown policy)".
+    Mock::given(method("GET"))
+        .and(path("/api/on-calls"))
+        .and(query_param("expand", "user"))
+        .and(query_param("expand", "escalationPolicy"))
+        .and(query_param("expand", "schedule"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "user": { "firstName": "Ada", "lastName": "Lovelace" },
+            "escalationPolicy": { "name": "P1" },
+            "schedule": { "name": "Nights" },
+        }])))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args(["on-call", "now", "-o", "table", "--api-key", "test-key"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Ada Lovelace (P1) via Nights"));
 }
 
 #[tokio::test]
@@ -2401,7 +2430,7 @@ async fn jq_filters_version_output() {
         .args(["version", "--jq", ".cli"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[tokio::test]
@@ -2415,7 +2444,10 @@ async fn version_still_prints_its_two_lines_when_piped() {
         .args(["version"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ilert 0.1.0"));
+        .stdout(predicate::str::contains(format!(
+            "ilert {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[tokio::test]

@@ -478,7 +478,7 @@ const SUCCESS_PAGE: &str = r##"<!doctype html>
       <div class="hdr"><i></i><i></i><span>try next</span></div>
       <div class="cmds">
         <div><span class="p">&rsaquo;</span>ilert alerts list <span class="c"># what&rsquo;s firing right now</span></div>
-        <div><span class="p">&rsaquo;</span>ilert on-call whoami <span class="c"># who&rsquo;s holding the pager</span></div>
+        <div><span class="p">&rsaquo;</span>ilert on-call now <span class="c"># who&rsquo;s holding the pager</span></div>
         <div><span class="p">&rsaquo;</span>ilert incidents create <span class="c"># declare an incident</span></div>
       </div>
     </div>

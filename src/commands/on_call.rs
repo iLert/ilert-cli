@@ -24,8 +24,16 @@ pub async fn handle(matches: &ArgMatches, client: &HttpClient, ctx: &RunContext)
 }
 
 async fn handle_now(client: &HttpClient, ctx: &RunContext) -> Result<()> {
+    // Without `expand` the API returns bare `{"id": …}` references for the
+    // user, policy and schedule, which is nothing anyone can read — the summary
+    // would be a column of "Unknown". The parameter repeats per entity.
+    let query: Vec<(String, String)> = ["user", "escalationPolicy", "schedule"]
+        .iter()
+        .map(|entity| ("expand".to_string(), (*entity).to_string()))
+        .collect();
+
     let (_, body) = client
-        .request(reqwest::Method::GET, "/api/on-calls", &[], &[], None)
+        .request(reqwest::Method::GET, "/api/on-calls", &query, &[], None)
         .await?;
 
     // The prose summary is the table rendering. Anything that asked for data —
@@ -111,13 +119,13 @@ fn on_call_line(item: &serde_json::Value) -> String {
     );
 
     format!(
-        "  {} {} {}",
+        "  {} {}{}",
         user.green().bold(),
         format!("({policy})").dimmed(),
         if schedule.is_empty() {
             String::new()
         } else {
-            format!("via {schedule}").dimmed().to_string()
+            format!(" {}", format!("via {schedule}").dimmed())
         }
     )
 }
