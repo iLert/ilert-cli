@@ -6,6 +6,8 @@ else
   set -o xtrace
 fi
 
+REPO="iLert/ilert-cli"
+
 curl_fetch_headers() {
   curl --silent --show-error --location --head --connect-timeout 10 --max-time 30 "$1"
 }
@@ -26,12 +28,97 @@ curl_download_file() {
   fi
 }
 
-VERSION=$(curl_fetch_headers "https://github.com/iLert/ilert-cli/releases/latest" | grep -i '^location:' | sed 's|.*/||' | tr -d '\r\n')
-if [ -z "$VERSION" ]; then
-  echo "Failed to determine latest release version."
-  exit 1
-fi
-echo "Installing ilert-cli version ${VERSION}"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else
+    return 1
+  fi
+}
+
+# Check a downloaded file against the SHA256SUMS asset published alongside it.
+#
+# This step is mandatory. The binary and the sums file come from the same host
+# over the same transport, so on its own it is not a defence against a
+# compromised release — it catches a truncated, corrupted or proxy-mangled
+# download, and it fails loudly if the release ever serves bytes that differ
+# from the ones it published. `verify_attestation` adds GitHub's own signature
+# over the release contents, when it can run.
+verify_checksum() {
+  local file="$1"
+  local asset="$2"
+  local sums_file="$3"
+
+  # Matched on the whole field: a prefix match would let the `ilert_arm64` line
+  # satisfy a request for `ilert_arm`. The `*name` form is what sha256sum
+  # writes for a file it read in binary mode.
+  local expected
+  expected=$(awk -v want="$asset" '$2 == want || $2 == "*" want { print $1; exit }' "$sums_file")
+  if [ -z "$expected" ]; then
+    echo "Release ${VERSION} publishes no checksum for '${asset}'; refusing to install an unverified binary."
+    exit 1
+  fi
+
+  local actual
+  if ! actual=$(sha256_of "$file"); then
+    echo "Found no sha256 tool (sha256sum, shasum or openssl); cannot verify the download."
+    exit 1
+  fi
+
+  if [ "$actual" != "$expected" ]; then
+    echo "Checksum mismatch for '${asset}':"
+    echo "  expected ${expected}"
+    echo "  actual   ${actual}"
+    echo "The download is corrupt or has been tampered with. Not installing."
+    exit 1
+  fi
+}
+
+# Check the downloaded asset against GitHub's immutable-release attestation.
+#
+# An immutable release is signed by GitHub, and `gh release verify-asset` checks
+# the file against that signature. What that establishes is membership: these
+# exact bytes are the ones this release carries, attested by GitHub rather than
+# by a sums file the same host served a moment earlier. It says nothing about
+# how the binary was built — not the workflow, not the commit, not the runner.
+#
+# This check is opportunistic: an old or unauthenticated gh means it cannot
+# run, and the mandatory checksum has already passed, so installation continues
+# with a note. Set ILERT_REQUIRE_ATTESTATION=1 to make an unavailable check
+# fatal too. A check that runs and *fails* is always fatal — there is no
+# falling back from that.
+verify_attestation() {
+  local file="$1"
+  local unavailable=""
+
+  if ! command -v gh >/dev/null 2>&1; then
+    unavailable="the GitHub CLI (gh) is not installed"
+  elif ! gh release verify-asset --help >/dev/null 2>&1; then
+    unavailable="this version of gh has no 'gh release verify-asset' command"
+  elif ! gh auth status --hostname github.com >/dev/null 2>&1; then
+    unavailable="gh is not authenticated against github.com"
+  fi
+
+  if [ -n "$unavailable" ]; then
+    if [ "${ILERT_REQUIRE_ATTESTATION:-0}" = "1" ]; then
+      echo "ILERT_REQUIRE_ATTESTATION=1, but ${unavailable}. Not installing."
+      exit 1
+    fi
+    echo "Skipping release attestation: ${unavailable}."
+    echo "The published SHA256 checksum already matched. Set ILERT_REQUIRE_ATTESTATION=1 to require attestation."
+    return 0
+  fi
+
+  echo "Verifying release attestation.."
+  if ! gh release verify-asset "$VERSION" "$file" --repo "$REPO"; then
+    echo "Release attestation verification failed for '${file##*/}'. Not installing."
+    exit 1
+  fi
+}
 
 # Prompt user to run a command with sudo; show exact command first.
 #
@@ -101,49 +188,90 @@ resolve_install_uri() {
   fi
 }
 
-TEMP_DIR=$(mktemp -d)
-TEMP_FILE="${TEMP_DIR}/ilert"
-trap 'rmdir "$TEMP_DIR" 2>/dev/null || true' EXIT
-
-if [ "$(uname)" == "Darwin" ]; then
-
-  INSTALL_URI=$(resolve_install_uri "/usr/local/bin/ilert")
-  FILE_URL="https://github.com/iLert/ilert-cli/releases/download/${VERSION}/ilert_mac"
-  echo "[MacOS] Downloading binary.. please be patient."
-  if ! curl_download_file "$FILE_URL" "$TEMP_FILE"; then
-    echo "Download failed or timed out. Please check your network connection and try again."
-    exit 1
-  fi
-  install_binary "$TEMP_FILE" "$INSTALL_URI"
-  echo "Done"
-  ilert --help
-
-elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
-
-  if [ "$(expr substr $(uname -m) 1 3)" == "arm" ]; then
-    INSTALL_URI=$(resolve_install_uri "/usr/bin/ilert")
-    FILE_URL="https://github.com/iLert/ilert-cli/releases/download/${VERSION}/ilert_arm"
-    echo "[ARM] Downloading binary.. please be patient."
-    if ! curl_download_file "$FILE_URL" "$TEMP_FILE"; then
-      echo "Download failed or timed out. Please check your network connection and try again."
-      exit 1
-    fi
-    install_binary "$TEMP_FILE" "$INSTALL_URI"
-    echo "Done"
-    ilert --help
-  else
-    INSTALL_URI=$(resolve_install_uri "/usr/bin/ilert")
-    FILE_URL="https://github.com/iLert/ilert-cli/releases/download/${VERSION}/ilert_linux"
-    echo "[Linux] Downloading binary.. please be patient."
-    if ! curl_download_file "$FILE_URL" "$TEMP_FILE"; then
-      echo "Download failed or timed out. Please check your network connection and try again."
-      exit 1
-    fi
-    install_binary "$TEMP_FILE" "$INSTALL_URI"
-    echo "Done"
-    ilert --help
-  fi
-
-else
-  echo "Unsupported platform, please install manually."
+# Everything above is a function definition; everything below installs. The
+# test suite sources this file with ILERT_INSTALL_SH_LIB_ONLY=1 to exercise the
+# helpers without downloading or installing anything.
+if [ -n "${ILERT_INSTALL_SH_LIB_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
 fi
+
+VERSION=$(curl_fetch_headers "https://github.com/${REPO}/releases/latest" | grep -i '^location:' | sed 's|.*/||' | tr -d '\r\n')
+if [ -z "$VERSION" ]; then
+  echo "Failed to determine latest release version."
+  exit 1
+fi
+echo "Installing ilert-cli version ${VERSION}"
+
+# Pick the release asset for this machine.
+#
+# `uname -m` reports `aarch64` (some kernels: `arm64`) on 64-bit ARM, which does
+# not begin with "arm" — so a prefix test for "arm" alone silently handed every
+# Graviton, Ampere and 64-bit Raspberry Pi OS host the x86_64 binary. The
+# architectures are matched exactly, and an unrecognised one now stops rather
+# than falling through to a binary that cannot run.
+case "$(uname -s)" in
+  Darwin)
+    # `ilert_mac` is a universal binary, so Apple Silicon and Intel Macs take
+    # the same asset; the loader selects the matching slice.
+    PLATFORM_LABEL="MacOS"
+    ASSET="ilert_mac"
+    INSTALL_URI=$(resolve_install_uri "/usr/local/bin/ilert")
+    ;;
+  Linux*)
+    case "$(uname -m)" in
+      aarch64|arm64)
+        PLATFORM_LABEL="Linux ARM64"
+        ASSET="ilert_arm64"
+        ;;
+      armv6l|armv7l|arm)
+        PLATFORM_LABEL="Linux ARM"
+        ASSET="ilert_arm"
+        ;;
+      x86_64|amd64)
+        PLATFORM_LABEL="Linux"
+        ASSET="ilert_linux"
+        ;;
+      *)
+        echo "Unsupported architecture '$(uname -m)', please install manually."
+        exit 1
+        ;;
+    esac
+    INSTALL_URI=$(resolve_install_uri "/usr/bin/ilert")
+    ;;
+  *)
+    echo "Unsupported platform '$(uname -s)', please install manually."
+    exit 1
+    ;;
+esac
+
+TEMP_DIR=$(mktemp -d)
+# Kept under the asset's real name: `gh release verify-asset` matches the local
+# file against the release asset of the same basename, so downloading to a
+# generic "ilert" would leave it with nothing to compare against.
+TEMP_FILE="${TEMP_DIR}/${ASSET}"
+SUMS_FILE="${TEMP_DIR}/SHA256SUMS"
+# The two files this script creates are named explicitly rather than cleaned up
+# with `rm -rf "$TEMP_DIR"`, so a surprising value in TEMP_DIR cannot turn into
+# a recursive delete.
+trap 'rm -f -- "$TEMP_FILE" "$SUMS_FILE"; rmdir "$TEMP_DIR" 2>/dev/null || true' EXIT
+
+BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+
+echo "[${PLATFORM_LABEL}] Downloading binary.. please be patient."
+if ! curl_download_file "${BASE_URL}/${ASSET}" "$TEMP_FILE"; then
+  echo "Download failed or timed out. Please check your network connection and try again."
+  exit 1
+fi
+
+echo "Verifying checksum.."
+if ! curl_download_file "${BASE_URL}/SHA256SUMS" "$SUMS_FILE"; then
+  echo "Release ${VERSION} publishes no SHA256SUMS file; refusing to install an unverified binary."
+  exit 1
+fi
+verify_checksum "$TEMP_FILE" "$ASSET" "$SUMS_FILE"
+
+verify_attestation "$TEMP_FILE"
+
+install_binary "$TEMP_FILE" "$INSTALL_URI"
+echo "Done"
+ilert --help

@@ -1,0 +1,423 @@
+name: release-binaries
+
+# GitHub immutable releases freeze a release's assets at publication, so
+# binaries can no longer be attached in response to `release: published`. The
+# order is inverted instead:
+#
+#   1. a human creates the tag and a *draft* release
+#   2. this workflow is dispatched with that tag and fills the draft
+#   3. a human reviews the completed draft and publishes it
+#
+# The tag must not move at any point in that sequence: the workflow re-resolves
+# it before uploading and refuses to attach binaries built from a different
+# commit, preflight reports whether a ruleset protects it, and the final step
+# prints the commit to confirm before publishing.
+#
+# Publication is deliberately left to a human: docker-release.yml triggers on
+# `release: published`, and a release published by GITHUB_TOKEN does not start
+# another workflow. Automating step 3 means either folding the Docker job into
+# this workflow or publishing with a GitHub App token or PAT.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the existing draft release to attach binaries to
+        required: true
+        type: string
+
+# One run per tag. `cancel-in-progress: false` is the important half: a run
+# cancelled partway through the upload would leave the draft holding some of
+# its assets, and preflight then refuses every retry until a human deletes
+# them by hand. Queueing behind the first run fails cleanly instead.
+concurrency:
+  group: release-binaries-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Same toolchain the Dockerfile pins, so the released binary and the released
+  # image come out of the same compiler.
+  RUST_VERSION: "1.96.0"
+  # cargo-zigbuild and the zig it drives are both pinned: rebuilding an old tag
+  # should not pick up whatever the current upstream release happens to be.
+  ZIGBUILD_VERSION: "0.22.1"
+  ZIG_VERSION: "0.15.2"
+  # The contract with install.sh, which derives its download URLs from these
+  # names. SHA256SUMS is generated from them and uploaded alongside.
+  RELEASE_ASSETS: "ilert_mac ilert_linux ilert_arm64 ilert_arm ilert.exe"
+
+jobs:
+  preflight:
+    name: Check draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # A draft release is visible only to a token with push access, so
+    # `contents: read` cannot even see one. This job checks out nothing and
+    # runs no project code — it only talks to the API — so the write token
+    # never comes near a build script.
+    permissions:
+      contents: write
+
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: Resolve the tag to a commit
+        id: resolve
+        run: |
+          # A draft release can name a tag that was never created, so the tag
+          # is resolved through the git ref API rather than trusted: a 404 here
+          # is the correct failure.
+          if ! ref=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" \
+                       --jq '.object.type + " " + .object.sha' 2>/dev/null); then
+            echo "::error::Tag '${TAG}' does not exist in ${GH_REPO}. Create the tag before dispatching this workflow."
+            exit 1
+          fi
+
+          type=${ref% *}
+          sha=${ref#* }
+          if [ "$type" = "tag" ]; then
+            # Annotated tag: the ref points at a tag object, not the commit.
+            sha=$(gh api "repos/${GH_REPO}/git/tags/${sha}" --jq '.object.sha')
+          fi
+
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Tag '${TAG}' resolves to commit ${sha}"
+
+      - name: Require an unpublished draft release
+        run: |
+          if ! release=$(gh release view "$TAG" --json isDraft,assets 2>/dev/null); then
+            echo "::error::No release found for tag '${TAG}'. Create a draft release for it first."
+            exit 1
+          fi
+
+          if [ "$(jq -r '.isDraft' <<<"$release")" != "true" ]; then
+            echo "::error::Release '${TAG}' is already published. An immutable release cannot receive new assets — cut a new tag and draft release instead."
+            exit 1
+          fi
+
+          # The run finishes by requiring the draft to hold exactly the assets it
+          # produced, and uploads without --clobber, so the draft has to start
+          # empty. Checked here rather than after the build, where the same
+          # problem would cost a full matrix run to discover.
+          existing=$(jq -r '.assets[].name' <<<"$release")
+          if [ -n "$existing" ]; then
+            echo "::error::Draft release '${TAG}' already holds assets:"
+            echo "$existing"
+            echo "::error::Delete them before re-running, so the release cannot end up holding binaries from two different runs."
+            exit 1
+          fi
+
+          echo "Draft release '${TAG}' is empty and ready."
+
+      - name: Report whether this tag is protected from moving
+        run: |
+          # Advisory, and deliberately specific: "some tag ruleset exists" says
+          # nothing about this tag. A ruleset only protects it if it is active,
+          # targets tags, its ref_name conditions cover refs/tags/<tag>, and it
+          # carries both the `update` rule (stops the tag being moved) and the
+          # `deletion` rule (stops it being removed and recreated elsewhere,
+          # which comes to the same thing).
+          #
+          # Include and exclude patterns are matched with bash globbing, which
+          # parts company with GitHub's fnmatch only for tag names containing a
+          # slash — version tags do not.
+          ref="refs/tags/${TAG}"
+
+          if ! ids=$(gh api "repos/${GH_REPO}/rulesets" \
+                       --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id' 2>/dev/null); then
+            echo "::notice::This token cannot read repository rulesets, so tag protection was not checked."
+            exit 0
+          fi
+
+          protecting=""
+          for id in $ids; do
+            if ! ruleset=$(gh api "repos/${GH_REPO}/rulesets/${id}" 2>/dev/null); then
+              echo "  ruleset ${id}: could not be read"
+              continue
+            fi
+
+            name=$(jq -r '.name' <<<"$ruleset")
+            rules=$(jq -r '[(.rules // [])[].type] | sort | join(" ")' <<<"$ruleset")
+
+            missing=""
+            case " $rules " in *" update "*) ;; *) missing="update" ;; esac
+            case " $rules " in *" deletion "*) ;; *) missing="${missing}${missing:+ and }deletion" ;; esac
+            if [ -n "$missing" ]; then
+              echo "  ${name}: no ${missing} rule (has: ${rules:-none})"
+              continue
+            fi
+
+            # ~ALL covers every ref. Otherwise the include patterns are matched
+            # against the full ref name, and any matching exclude wins.
+            covered=no
+            while IFS= read -r pattern; do
+              [ -z "$pattern" ] && continue
+              if [ "$pattern" = "~ALL" ] || [[ "$ref" == $pattern ]]; then
+                covered=yes
+                break
+              fi
+            done <<<"$(jq -r '(.conditions.ref_name.include // [])[]' <<<"$ruleset")"
+
+            while IFS= read -r pattern; do
+              [ -z "$pattern" ] && continue
+              if [[ "$ref" == $pattern ]]; then
+                covered=no
+                break
+              fi
+            done <<<"$(jq -r '(.conditions.ref_name.exclude // [])[]' <<<"$ruleset")"
+
+            if [ "$covered" = "yes" ]; then
+              protecting="${protecting}${protecting:+, }${name}"
+            else
+              echo "  ${name}: blocks updates and deletions, but does not cover ${ref}"
+            fi
+          done
+
+          if [ -n "$protecting" ]; then
+            echo "Tag '${TAG}' is protected against being moved or deleted by: ${protecting}"
+          else
+            echo "::warning::No active ruleset covers tag '${TAG}'. Add one targeting refs/tags/* with the 'Restrict updates' and 'Restrict deletions' rules."
+          fi
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    strategy:
+      # One target failing should not hide whether the others are fine.
+      fail-fast: false
+      matrix:
+        include:
+          # Built as a universal binary: install.sh serves `ilert_mac` to every
+          # Mac, Intel ones included, without inspecting `uname -m`.
+          - asset: ilert_mac
+            os: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            zig: false
+
+          # The `.2.17` suffix is a cargo-zigbuild feature: it links against
+          # glibc 2.17 rather than whatever the runner image ships, so the
+          # binary still runs on distributions older than the runner.
+          - asset: ilert_linux
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu.2.17
+            zig: true
+
+          # 64-bit ARM: Graviton, Ampere, Apple Silicon containers, and 64-bit
+          # Raspberry Pi OS. Distinct from `ilert_arm`, which is 32-bit armv6/7.
+          - asset: ilert_arm64
+            os: ubuntu-latest
+            targets: aarch64-unknown-linux-gnu.2.17
+            zig: true
+
+          - asset: ilert_arm
+            os: ubuntu-latest
+            targets: arm-unknown-linux-gnueabihf.2.17
+            zig: true
+
+          - asset: ilert.exe
+            os: ubuntu-latest
+            targets: x86_64-pc-windows-gnu
+            zig: true
+
+    steps:
+      # Actions are pinned to full commit SHAs, the only immutable reference
+      # GitHub offers: a tag can be repointed at new code by whoever owns the
+      # action. Update the SHA and the trailing version comment together.
+      - name: Checkout ${{ needs.preflight.outputs.sha }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the tag resolved to in preflight, not the tag name: every
+          # matrix leg then builds the same commit even if the tag is moved
+          # while the workflow runs.
+          ref: ${{ needs.preflight.outputs.sha }}
+          # Nothing here pushes, so the job does not need the token that
+          # checkout would otherwise leave behind in .git/config.
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          for target in ${{ matrix.targets }}; do
+            # rustup wants the bare triple; the glibc suffix is zig's, not its.
+            rustup target add "${target%%.*}"
+          done
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zig
+        run: |
+          # The pip package is just the zig release, and it is the one
+          # distribution channel that pins by version cleanly.
+          pip3 install --break-system-packages "ziglang==$ZIG_VERSION"
+          # cargo-zigbuild looks for `zig` on PATH first; give it one rather
+          # than relying on its fallback to the python module.
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod 755 /usr/local/bin/zig
+          zig version
+          cargo install cargo-zigbuild --locked --version "$ZIGBUILD_VERSION"
+
+      - name: Build
+        # --locked so the release is built from the committed Cargo.lock and
+        # not from whatever resolves newest on the day of the build.
+        run: |
+          for target in ${{ matrix.targets }}; do
+            if [ "${{ matrix.zig }}" = "true" ]; then
+              cargo zigbuild --locked --release --target "$target"
+            else
+              cargo build --locked --release --target "$target"
+            fi
+          done
+
+      - name: Collect ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          # cargo puts output under the bare triple even when zig was given a
+          # glibc-suffixed one.
+          binary=ilert
+          case "${{ matrix.asset }}" in *.exe) binary=ilert.exe ;; esac
+
+          paths=""
+          for target in ${{ matrix.targets }}; do
+            paths="$paths target/${target%%.*}/release/$binary"
+          done
+
+          # More than one target means the two macOS slices, which are shipped
+          # as a single fat binary.
+          if [ "$(echo $paths | wc -w)" -gt 1 ]; then
+            lipo -create -output "dist/${{ matrix.asset }}" $paths
+            lipo -info "dist/${{ matrix.asset }}"
+          else
+            cp $paths "dist/${{ matrix.asset }}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  attach:
+    name: Attach binaries to the draft release
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # The only job that can write, and it runs no project code — just `gh`
+    # against artifacts the build jobs produced.
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          # Every expected binary is named explicitly, so a matrix leg that
+          # silently produced nothing fails the release here rather than
+          # shipping a short SHA256SUMS that install.sh would then reject on
+          # the user's machine.
+          for asset in $RELEASE_ASSETS; do
+            if [ ! -f "$asset" ]; then
+              echo "::error::Build artifact '${asset}' is missing; not attaching a partial release."
+              exit 1
+            fi
+          done
+
+          sha256sum $RELEASE_ASSETS > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Re-check the release is still a draft
+        run: |
+          # The window between preflight and here is minutes long, and a human
+          # publishing the draft in that window would make the upload fail
+          # halfway with a far less obvious error.
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
+            echo "::error::Release '${TAG}' was published while this workflow was running; its assets are now immutable."
+            exit 1
+          fi
+
+      - name: Require the tag to still point at the built commit
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          # The binaries in dist/ were built from EXPECTED_SHA, resolved in
+          # preflight up to an hour ago. If the tag has been moved since, these
+          # assets no longer correspond to the source the release will show, and
+          # attaching them would produce exactly the mismatch immutability is
+          # supposed to rule out. Resolved the same way preflight did, so an
+          # annotated tag is compared commit-to-commit and not tag-object-to-
+          # commit.
+          if ! ref=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" \
+                       --jq '.object.type + " " + .object.sha' 2>/dev/null); then
+            echo "::error::Tag '${TAG}' no longer exists — it was deleted while the build was running."
+            exit 1
+          fi
+
+          type=${ref% *}
+          sha=${ref#* }
+          if [ "$type" = "tag" ]; then
+            sha=$(gh api "repos/${GH_REPO}/git/tags/${sha}" --jq '.object.sha')
+          fi
+
+          if [ "$sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::Tag '${TAG}' moved while the build was running: preflight resolved ${EXPECTED_SHA}, it now points at ${sha}. These binaries were built from the former, so they are not attached."
+            exit 1
+          fi
+
+          echo "Tag '${TAG}' still points at ${sha}."
+
+      - name: Upload assets to the draft release
+        working-directory: dist
+        run: |
+          # No --clobber: an upload that collides with an existing asset must
+          # fail loudly rather than overwrite it, so a release can never end up
+          # holding a mixture of binaries from two different runs.
+          gh release upload "$TAG" $RELEASE_ASSETS SHA256SUMS
+
+      - name: Verify the draft holds exactly the expected assets
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          expected=$(printf '%s\n' $RELEASE_ASSETS SHA256SUMS | sort)
+          actual=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Draft release '${TAG}' does not hold exactly the expected assets."
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+
+          echo "$actual"
+          echo
+          echo "Draft release '${TAG}' is complete, built from commit ${EXPECTED_SHA}."
+          echo
+          echo "Before publishing, confirm the tag still points at that commit:"
+          echo "    git fetch --tags --force && git rev-parse '${TAG}^{commit}'"
+          echo
+          echo "Publish by hand once it matches. Publishing freezes these assets and is"
+          echo "what triggers docker-release.yml; a release published with GITHUB_TOKEN"
+          echo "would not trigger docker-release.yml."
