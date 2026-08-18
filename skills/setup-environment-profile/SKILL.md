@@ -1,6 +1,6 @@
 ---
 name: setup-environment-profile
-description: Point the ilert CLI at a non-production ilert environment by giving it its own profile
+description: Point the ilert CLI at a staging, preview or self-hosted ilert environment by giving it its own profile
 user-invocable: true
 ---
 
@@ -9,7 +9,7 @@ user-invocable: true
 Use this when the CLI has to talk to something other than ilert's production API —
 a staging or preview instance, or a self-hosted deployment.
 
-Nothing about a non-production environment is compiled into the CLI. The endpoint
+Nothing about such an environment is compiled into the CLI. The endpoint
 and the OAuth application that goes with it live in the operator's own config, so
 setting one up is a configuration task, not a code change. **Never add a hostname
 or client id to this repository** — not to source, not to a test, not to this

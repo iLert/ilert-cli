@@ -1,6 +1,6 @@
 ---
 name: ilert-essentials
-description: How ilert and the ilert CLI actually behave — the rules that are not in --help or the field names
+description: Core ilert concepts and CLI behaviour: the object model and the rules behind the field names
 user-invocable: true
 ---
 
