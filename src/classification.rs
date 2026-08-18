@@ -343,6 +343,18 @@ pub const STATIC_COMMANDS: &[(&str, Classification)] = &[
     // it needs to ask about is running the installer, not an API call.
     ("update", Classification::new(false, false, true)),
     ("config import", Classification::new(false, false, true)),
+    // Deleting a cache is a local mutation, not a destructive one: nothing on
+    // the server changes, and every file dropped is one the CLI refetches by
+    // itself on the next run that needs it. Repeating either is the same as
+    // running it once.
+    (
+        "config cache clear",
+        Classification::new(false, false, true),
+    ),
+    (
+        "config cache refresh",
+        Classification::new(false, false, true),
+    ),
     // Remote mutations.
     ("event send", Classification::new(false, false, false)),
     ("heartbeat ping", Classification::new(false, false, true)),

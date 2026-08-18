@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use colored::Colorize;
 use serde_json::Value;
 
 use crate::classification::{self, Classification};
@@ -130,11 +131,7 @@ impl OperationIndex {
 /// Load index from cache synchronously. Returns None if no cache exists.
 /// Used at startup to build the dynamic command tree without network access.
 pub fn load_cached_index(base_url: &str) -> Result<Option<OperationIndex>> {
-    let cache_path = cache_file_path(base_url)?;
-    match load_from_cache(&cache_path)? {
-        Some(spec) => Ok(Some(build_index(&spec)?)),
-        None => Ok(None),
-    }
+    load_index_from_cache(&cache_file_path(base_url)?)
 }
 
 /// Ensure we have a fresh spec. Fetches if missing or stale, returns the index.
@@ -145,10 +142,11 @@ pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
     // the wrong origin is worse than sending one request there.
     let spec_url = Endpoint::parse(base_url)?.resolve("/api-docs/openapi.json")?;
 
-    // Try cache first
-    if let Some(cached) = load_from_cache(&cache_path)? {
+    // Try cache first. An unusable one reads as absent, so it falls through to
+    // the fetch below and is replaced rather than becoming an error.
+    if let Some(cached) = load_index_from_cache(&cache_path)? {
         if !is_cache_stale(&cache_path)? {
-            return build_index(&cached);
+            return Ok(cached);
         }
         // Stale — try refresh, fall back to stale
         eprintln!("Note: API spec cache is stale, refreshing...");
@@ -157,10 +155,10 @@ pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
             return build_index(&fresh);
         }
         eprintln!("Warning: Could not refresh API spec, using cached version.");
-        return build_index(&cached);
+        return Ok(cached);
     }
 
-    // No cache — must fetch
+    // No cache, or none we can use — must fetch
     let spec = fetch_spec(&spec_url)
         .await
         .context("Failed to fetch API spec. Check your network connection.")?;
@@ -242,7 +240,7 @@ pub(crate) fn cache_file_path(base_url: &str) -> Result<PathBuf> {
 /// A filesystem-safe, stable name for an environment: a readable slug of the
 /// host so the cache directory can be understood at a glance, plus a digest so
 /// two URLs that slugify the same never share a file.
-fn cache_key(base_url: &str) -> String {
+pub(crate) fn cache_key(base_url: &str) -> String {
     let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
     let bare = normalized
         .strip_prefix("https://")
@@ -274,13 +272,99 @@ fn fnv1a(value: &str) -> u32 {
     hash
 }
 
-fn load_from_cache(path: &PathBuf) -> Result<Option<Value>> {
+/// Every cached spec on disk, across all environments.
+///
+/// Listed by scanning rather than by asking the config which profiles exist:
+/// a spec is cached per base URL, and base URLs arrive from `--base-url` and
+/// `ILERT_BASE_URL` too, so the config does not know all of them. Anything a
+/// past run left behind is still cache, and a clear that skipped it would be
+/// the kind that has to be explained.
+///
+/// Matched on the exact shape `cache_file_path` writes, so nothing else living
+/// in the cache directory — a staged installer, the check markers — is caught
+/// by a command that only promised to drop specs.
+pub(crate) fn cached_spec_paths() -> Result<Vec<PathBuf>> {
+    let cache_dir = ConfigManager::cache_dir()?;
+    let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n == LEGACY_CACHE_FILE || (n.starts_with("openapi-") && n.ends_with(".json"))
+            })
+        })
+        .collect();
+    // Stable order, so the list a clear reports is reproducible.
+    paths.sort();
+    Ok(paths)
+}
+
+/// `info.version` of the spec cached for `base_url`, if there is one.
+pub(crate) fn cached_spec_version(base_url: &str) -> Option<String> {
+    let path = cache_file_path(base_url).ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Value>(&content)
+        .ok()?
+        .get("info")?
+        .get("version")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Read the cached spec as a usable index, treating one that cannot be read —
+/// or cannot be used — as one that is not there.
+///
+/// A cache is a copy of something obtainable, so a damaged one is a reason to
+/// refetch, never a reason to fail. It used to propagate: a truncated write, a
+/// full disk, a hand-edited file — and the error surfaced from `load_cached_index`
+/// inside `Cli::new`, before any command exists. That failed *every* invocation
+/// with a parse error, including `ilert config cache clear`, the one command
+/// whose whole job is to clear it. There was no way out of that state from
+/// inside the CLI.
+///
+/// Indexing happens here, behind the same treatment, rather than in the callers:
+/// "parses as JSON" is not the bar, "is an OpenAPI document we can build a
+/// command tree from" is. A file holding `{}` clears the parser and then fails
+/// in `build_index` for want of `paths` — and a failure there arrives at exactly
+/// the same place, before any command exists, with exactly the same lockout.
+/// The only definition of a usable cache that helps is the one the caller
+/// actually needs.
+///
+/// The warning is worth the noise: silently refetching a spec that is corrupt on
+/// disk would hide a failing disk or a bad write behind a slower startup.
+fn load_index_from_cache(path: &PathBuf) -> Result<Option<OperationIndex>> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(path).context("Failed to read cached spec")?;
-    let spec: Value = serde_json::from_str(&content).context("Failed to parse cached spec")?;
-    Ok(Some(spec))
+
+    let unusable = |reason: &str| {
+        eprintln!(
+            "{} Ignoring the cached API spec at {} ({reason}). It will be refetched; \
+             `ilert config cache clear` removes it.",
+            "Warning:".yellow().bold(),
+            path.display(),
+        );
+    };
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        unusable("could not be read");
+        return Ok(None);
+    };
+    let Ok(spec) = serde_json::from_str::<Value>(&content) else {
+        unusable("is not valid JSON");
+        return Ok(None);
+    };
+    match build_index(&spec) {
+        Ok(index) => Ok(Some(index)),
+        Err(e) => {
+            unusable(&format!("is not a usable OpenAPI document: {e}"));
+            Ok(None)
+        }
+    }
 }
 
 fn is_cache_stale(path: &PathBuf) -> Result<bool> {
@@ -646,7 +730,46 @@ fn follow_ref<'a>(ref_path: &str, spec: &'a Value) -> Option<&'a Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_key;
+    use super::{cache_key, load_index_from_cache};
+
+    /// Every shape of unusable cache has to read as "not there", because the
+    /// caller that hits it first runs before any command exists — an error there
+    /// takes down `config cache clear` along with everything else, and that is
+    /// the one command that could have fixed it.
+    #[test]
+    fn an_unusable_cached_spec_reads_as_no_cache_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, content) in [
+            ("truncated.json", "{\"paths\": {"),
+            ("garbage.json", "not json at all"),
+            // Valid JSON, and still not something a command tree can be built
+            // from — the case a parse check alone lets through.
+            ("empty-object.json", "{}"),
+            ("wrong-document.json", r#"{"kind":"Deployment"}"#),
+            ("paths-not-an-object.json", r#"{"paths": []}"#),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).expect("write");
+            let loaded = load_index_from_cache(&path).expect("an unusable cache is not an error");
+            assert!(loaded.is_none(), "{name} should have been ignored");
+        }
+    }
+
+    #[test]
+    fn a_usable_cached_spec_is_indexed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spec.json");
+        std::fs::write(
+            &path,
+            r#"{"paths":{"/alerts":{"get":{"operationId":"getAlerts","tags":["Alerts"]}}}}"#,
+        )
+        .expect("write");
+
+        let index = load_index_from_cache(&path)
+            .expect("a usable cache loads")
+            .expect("a usable cache is present");
+        assert!(index.by_id.contains_key("getAlerts"));
+    }
 
     #[test]
     fn environments_get_separate_cache_keys() {

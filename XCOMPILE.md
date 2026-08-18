@@ -46,19 +46,29 @@ mkdir -p x_builds && cp target/release/ilert x_builds/ilert_mac && cp target/x86
 
 # Cross compile release build via gh
 
-```sh
-git tag -a 0.2.0 -m "ilert-cli 0.2.0"
-git push origin 0.2.0
+`./scripts/release.sh` does all of the below: it tags, pushes, creates the draft
+release, dispatches the workflow and waits for it, then prints the publish
+command. Bump `version` in Cargo.toml first, it takes the version from there.
 
-gh release create 0.2.0 \
+```sh
+./scripts/release.sh
+```
+
+The steps it runs, if you need to do them by hand:
+
+```sh
+git tag -a 0.3.0 -m "ilert-cli 0.3.0"
+git push origin 0.3.0
+
+gh release create 0.3.0 \
   --draft \
   --prerelease=false \
   --verify-tag \
-  --title "0.2.0"
+  --title "0.3.0"
 # leave notes blank, on submit choose "Save as draft"
 
-gh workflow run release-binaries.yml --ref master -f tag=0.2.0
+gh workflow run release-binaries.yml --ref master -f tag=0.3.0
 
 # wait until workflow succeeds and verify all six expected assets are attached, then
-gh release edit 0.2.0 --draft=false
+gh release edit 0.3.0 --draft=false
 ```

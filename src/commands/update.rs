@@ -95,7 +95,7 @@ pub async fn handle(_matches: &ArgMatches, ctx: &RunContext) -> Result<()> {
     let _ = std::fs::remove_file(&script_path);
     outcome?;
 
-    // The update check caches "latest vs current" for twelve hours, and both
+    // The update check caches "latest vs current" for an hour, and both
     // halves of that comparison just changed. Dropping the file makes the next
     // run re-check rather than repeat a notice about the version we now are.
     if let Ok(path) = crate::commands::version::check_file_path() {

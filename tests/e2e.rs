@@ -3116,6 +3116,76 @@ async fn the_spec_cache_is_kept_per_environment() {
     );
 }
 
+/// A cache the CLI cannot use must never be able to lock the CLI out.
+///
+/// Everything here happens inside `Cli::new`, before a command exists — so a
+/// cache that fails to load takes `config cache clear` down with it, and that is
+/// the one command whose whole job is to fix this. Both shapes have to survive:
+/// bytes that are not JSON, and JSON that is not an OpenAPI document. The second
+/// is the one a parse check alone lets through.
+#[tokio::test]
+async fn an_unusable_spec_cache_does_not_lock_the_cli_out() {
+    for damage in ["not json at all", "{}", r#"{"paths": []}"#] {
+        let h = TestHarness::start().await;
+        h.seed_cache().await;
+        let cached = h.spec_cache_files();
+        assert_eq!(cached.len(), 1, "expected exactly one cached spec");
+        std::fs::write(&cached[0], damage).expect("damage the cache");
+
+        // The command that repairs it has to run.
+        h.cmd()
+            .args(["config", "cache", "clear"])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Ignoring the cached API spec"));
+        assert!(
+            h.spec_cache_files().is_empty(),
+            "`config cache clear` left {damage:?} on disk"
+        );
+
+        // ...and an ordinary command recovers on its own, by refetching.
+        std::fs::write(&cached[0], damage).expect("damage the cache again");
+        h.cmd()
+            .args(["ops", "list", "-o", "raw"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("alerts"));
+    }
+}
+
+/// A cold start fetches the spec once, not twice.
+///
+/// Two things want the spec on a first run: the command itself, through
+/// `ensure_spec`, and the background check that asks whether the cached spec is
+/// still current. The second has nothing to compare against yet — so unless it
+/// recognises a spec written moments ago as already verified, every first
+/// command against an environment downloads the whole document twice.
+#[tokio::test]
+async fn a_cold_start_downloads_the_spec_only_once() {
+    let h = TestHarness::start().await;
+
+    h.cmd()
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success();
+    assert_eq!(
+        h.spec_request_count().await,
+        1,
+        "the first command downloaded the spec more than once"
+    );
+
+    // And the run after it, with the spec now cached, asks for nothing.
+    h.cmd()
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success();
+    assert_eq!(
+        h.spec_request_count().await,
+        1,
+        "a warm run re-fetched the spec"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Credentials are bound to the environment that issued them
 // ---------------------------------------------------------------------------

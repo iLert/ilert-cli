@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, IsTerminal};
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -142,6 +143,53 @@ impl RunContext {
     }
 }
 
+/// How long `run` will wait on the background version check once the command
+/// itself is done. Long enough for an ordinary round trip to GitHub, short
+/// enough that a network that has stopped answering costs a noticeable pause
+/// once an hour and nothing more.
+const UPDATE_REFRESH_BUDGET: Duration = Duration::from_secs(2);
+
+/// Whether a command should carry the update check at all.
+///
+/// Two commands are excluded, both because the background refresh would race
+/// the very files they exist to manage. `update` deletes the cached result on
+/// its way out, precisely so the next run re-checks against the version it just
+/// became — and a refresh still in flight writes that file back afterwards. The
+/// same is true of `config cache clear` and `refresh`, which would otherwise
+/// report having deleted files that a task spawned milliseconds earlier then
+/// recreates. `update` has a second reason on top: its notice tells the reader
+/// to run `ilert update`, which is a strange thing to print to someone who
+/// just did.
+///
+/// `version` is deliberately not on this list. Asking which version this is, is
+/// the moment a newer one is most worth hearing about.
+fn wants_update_check(matches: &ArgMatches) -> bool {
+    match matches.subcommand() {
+        Some(("update", _)) => false,
+        Some(("config", sub)) => sub.subcommand_name() != Some("cache"),
+        _ => true,
+    }
+}
+
+/// Delete every cache artefact and report what went, newest concern first.
+///
+/// Best effort per file, and deliberately so: a cache entry that cannot be
+/// removed is not a reason to leave the rest in place, and the next run treats
+/// a missing file and an unreadable one the same way regardless.
+fn clear_cache() -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let mut targets = openapi::cached_spec_paths()?;
+    targets.extend(version::api_check_paths()?);
+    targets.extend(version::check_file_path());
+
+    for path in targets {
+        if std::fs::remove_file(&path).is_ok() {
+            removed.push(path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(removed)
+}
+
 /// Names reserved for static subcommands — dynamic tags must not collide.
 const STATIC_COMMANDS: &[&str] = &[
     "auth",
@@ -163,6 +211,10 @@ const STATIC_COMMANDS: &[&str] = &[
 pub struct Cli {
     config_manager: ConfigManager,
     cached_index: Option<OperationIndex>,
+    /// The environment resolved before parsing, kept because `--version` is
+    /// answered by clap during parsing and still has to name the spec cached
+    /// for the right one.
+    bootstrap_base_url: String,
 }
 
 impl Cli {
@@ -176,17 +228,25 @@ impl Cli {
         Ok(Self {
             config_manager,
             cached_index,
+            bootstrap_base_url: base_url,
         })
     }
 
     pub async fn run(mut self) -> Result<()> {
-        let cmd = build_command(&self.cached_index);
+        // Read off the raw command line rather than from `matches`, because the
+        // outputs that need it most are the ones clap prints and exits on:
+        // `--version`, `--help`, and parse errors all happen inside
+        // `try_get_matches`, so a flag applied after it comes too late for them.
+        if std::env::args().any(|a| a == "--no-color") {
+            colored::control::set_override(false);
+        }
+
+        let cmd = build_command(&self.cached_index, &self.bootstrap_base_url);
         let matches = match cmd.try_get_matches() {
             Ok(m) => m,
             Err(e) => e.exit(),
         };
 
-        // Handle --no-color
         if matches.get_flag("no-color") {
             colored::control::set_override(false);
         }
@@ -228,10 +288,24 @@ impl Cli {
                 .map(String::as_str),
         );
 
-        // Background update check (fire and forget, skip if quiet)
-        if !quiet {
-            tokio::spawn(version::check_for_updates());
-        }
+        // The update notice for a result already on disk, printed here so it sits
+        // above the command's output rather than somewhere inside it. The
+        // request that produces the *next* result runs alongside the command and
+        // is collected below.
+        let update_refresh = if quiet || !wants_update_check(&matches) {
+            None
+        } else {
+            version::print_cached_update_notice();
+            // The environment this invocation actually resolved to, flags and
+            // all. Re-resolving it inside the check from the default profile
+            // meant `--profile staging` or `--base-url ...` refreshed
+            // production's spec instead — the one environment the command was
+            // not talking to.
+            let base_url = resolved.base_url.clone();
+            Some(tokio::spawn(async move {
+                version::refresh_checks(&base_url).await
+            }))
+        };
 
         let ctx = RunContext {
             format: output_format,
@@ -253,6 +327,22 @@ impl Cli {
 
         let result = self.dispatch(&matches, &resolved, &ctx).await;
 
+        // Collect the refresh before returning. Dropping it is not "leave it
+        // running": the runtime is dropped when `main` returns and takes any
+        // unfinished task with it, and an ordinary command finishes in tens of
+        // milliseconds — far inside a single HTTP round trip. Left detached, the
+        // check was cancelled mid-request on nearly every run, so the cache
+        // stayed at whatever a rare slow command had last managed to write.
+        //
+        // Bounded because this is the one thing standing between the user and
+        // their exit code, and it is only a version check. A cap it reaches is a
+        // check skipped until the next run, which is the same outcome as the
+        // request having failed. It runs before the error path below, so a
+        // command that failed still refreshes the cache.
+        if let Some(handle) = update_refresh {
+            let _ = tokio::time::timeout(UPDATE_REFRESH_BUDGET, handle).await;
+        }
+
         if let Err(ref err) = result {
             output::print_error(err, output_format);
             std::process::exit(crate::errors::exit_code(err));
@@ -269,7 +359,7 @@ impl Cli {
     ) -> Result<()> {
         match matches.subcommand() {
             Some(("auth", sub)) => self.handle_auth(sub, config, ctx).await,
-            Some(("config", sub)) => self.handle_config(sub, config, ctx),
+            Some(("config", sub)) => self.handle_config(sub, config, ctx).await,
             Some(("completions", sub)) => self.handle_completions(sub, ctx),
             Some(("ops", sub)) => self.handle_ops(sub, config, ctx).await,
             Some(("api", sub)) => self.handle_api(sub, config, ctx).await,
@@ -295,7 +385,7 @@ impl Cli {
                 }
             },
             Some(("update", sub)) => update::handle(sub, ctx).await,
-            Some(("version", _)) => version::handle(ctx),
+            Some(("version", _)) => version::handle(ctx, &config.base_url),
             Some(("dashboard", _)) => {
                 ctx.reject_jq("the dashboard", Some("'ilert status -o json'"))?;
                 let client = self.make_client(config, true, ctx).await?;
@@ -303,7 +393,7 @@ impl Cli {
             }
             Some((tag, sub)) => self.handle_dynamic(tag, sub, config, ctx).await,
             None => {
-                build_command(&self.cached_index).print_help()?;
+                build_command(&self.cached_index, &self.bootstrap_base_url).print_help()?;
                 Ok(())
             }
         }
@@ -602,7 +692,7 @@ impl Cli {
 
     // -- Config commands --
 
-    fn handle_config(
+    async fn handle_config(
         &mut self,
         matches: &ArgMatches,
         config: &ResolvedConfig,
@@ -634,11 +724,76 @@ impl Cli {
                 self.handle_config_import(config)?;
                 Ok(())
             }
+            Some(("cache", sub)) => self.handle_config_cache(sub, config, ctx).await,
             _ => {
-                eprintln!("Usage: ilert config <list|show|import>");
+                eprintln!("Usage: ilert config <list|show|import|cache>");
                 Ok(())
             }
         }
+    }
+
+    /// `ilert config cache clear|refresh`.
+    ///
+    /// Both operate on the whole cache rather than one file of it. The three
+    /// artefacts — the per-environment specs, the release check, the spec check
+    /// marker — are what a stale-cache problem is actually made of, and leaving
+    /// one of them behind is how "I cleared the cache and it still misbehaves"
+    /// happens.
+    ///
+    /// `refresh` clears first and then refetches, so it goes through exactly the
+    /// paths a cold start does. Warming the cache by other means would leave the
+    /// one thing worth testing — that a first run can build itself from nothing
+    /// — untested by the command that looks like it tests it.
+    async fn handle_config_cache(
+        &mut self,
+        matches: &ArgMatches,
+        config: &ResolvedConfig,
+        ctx: &RunContext,
+    ) -> Result<()> {
+        let refresh = match matches.subcommand() {
+            Some(("clear", _)) => false,
+            Some(("refresh", _)) => true,
+            _ => {
+                eprintln!("Usage: ilert config cache <clear|refresh>");
+                return Ok(());
+            }
+        };
+
+        let cleared = clear_cache()?;
+        // Dropped along with the files it was built from. Keeping it would let
+        // this process go on answering from a spec that is no longer on disk.
+        self.cached_index = None;
+
+        if !refresh {
+            return ctx.print(&serde_json::json!({ "cleared": cleared }));
+        }
+
+        // Only this environment's spec is refetched, though every environment's
+        // was cleared: the others belong to profiles this invocation was not
+        // pointed at, and fetching them would mean reaching hosts the user did
+        // not name. They refill on their next use, which is what the clear on
+        // its own already arranged.
+        let index = openapi::ensure_spec(&config.base_url).await?;
+        let spec_version = openapi::cached_spec_version(&config.base_url);
+        self.cached_index = Some(index);
+
+        // `ensure_spec` has just written this environment's spec, and the
+        // background check treats a spec written inside the interval as already
+        // verified — so the refresh below will not download the same document a
+        // second time.
+        //
+        // The release check writes its own result; read it back rather than
+        // reimplement the comparison here.
+        version::refresh_checks(&config.base_url).await;
+        let latest = version::cached_latest_version();
+
+        ctx.print(&serde_json::json!({
+            "cleared": cleared,
+            "base_url": config.base_url,
+            "spec_version": spec_version,
+            "cli_version": version::current_version(),
+            "cli_latest": latest,
+        }))
     }
 
     fn handle_config_import(&mut self, config: &ResolvedConfig) -> Result<()> {
@@ -711,7 +866,7 @@ impl Cli {
         let shell: clap_complete::Shell = shell
             .parse()
             .map_err(|_| crate::errors::CliError::user(format!("Unknown shell: {shell}")))?;
-        let mut cmd = build_command(&self.cached_index);
+        let mut cmd = build_command(&self.cached_index, &self.bootstrap_base_url);
         clap_complete::generate(shell, &mut cmd, "ilert", &mut std::io::stdout());
         Ok(())
     }
@@ -1273,13 +1428,15 @@ fn scan_flag(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
-fn build_command(index: &Option<OperationIndex>) -> Command {
+fn build_command(index: &Option<OperationIndex>, base_url: &str) -> Command {
     let mut app = Command::new("ilert")
         .about(
             "The official ilert CLI\n\n\
              AI agents: run `ilert skills show ilert-essentials` before your first command.",
         )
-        .version(version::current_version())
+        // The same block `ilert version` prints. clap renders this verbatim, so
+        // the spec line rides along on `--version` too.
+        .version(version::clap_version_block(base_url))
         .arg_required_else_help(true)
         .after_help(
             "Examples:\n  \
@@ -1603,7 +1760,8 @@ pub fn static_command_paths() -> Vec<String> {
         }
     }
 
-    let root = build_command(&None);
+    // Enumerating the command tree, which the version string plays no part in.
+    let root = build_command(&None, "");
     let mut out = Vec::new();
     for sub in root.get_subcommands() {
         walk(sub, "", &mut out);
@@ -1722,6 +1880,18 @@ fn build_config_command() -> Command {
         .subcommand(
             Command::new("import").about("Import config from ILERT_* environment variables"),
         )
+        .subcommand(
+            Command::new("cache")
+                .about("Manage the local cache")
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("clear").about("Delete the cached API spec and check results"),
+                )
+                .subcommand(
+                    Command::new("refresh")
+                        .about("Delete the cache, then refetch the API spec and version check"),
+                ),
+        )
 }
 
 fn build_completions_command() -> Command {
@@ -1834,4 +2004,35 @@ fn levenshtein(a: &str, b: &str) -> usize {
     }
 
     prev[n]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The commands the background refresh must not reach: it would rewrite the
+    /// very files they delete on purpose, and `update` would additionally tell
+    /// the reader to run what they are already running.
+    #[test]
+    fn the_cache_managing_commands_skip_the_version_check() {
+        let parse = |args: &[&str]| {
+            build_command(&None, "")
+                .try_get_matches_from(args)
+                .expect("parses")
+        };
+
+        assert!(!wants_update_check(&parse(&["ilert", "update"])));
+        assert!(!wants_update_check(&parse(&[
+            "ilert", "config", "cache", "clear"
+        ])));
+        assert!(!wants_update_check(&parse(&[
+            "ilert", "config", "cache", "refresh"
+        ])));
+
+        // The rest of `config` is untouched — nothing there manages the cache.
+        assert!(wants_update_check(&parse(&["ilert", "config", "list"])));
+        assert!(wants_update_check(&parse(&["ilert", "config", "show"])));
+        assert!(wants_update_check(&parse(&["ilert", "version"])));
+        assert!(wants_update_check(&parse(&["ilert", "status"])));
+    }
 }

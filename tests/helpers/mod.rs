@@ -117,6 +117,28 @@ impl TestHarness {
         .expect("write secret file");
     }
 
+    /// The cached spec files this harness's runs have written.
+    ///
+    /// Found by scanning rather than by name: the file name carries a hash of
+    /// the base URL, and the harness's server picks a fresh port each run.
+    pub fn spec_cache_files(&self) -> Vec<PathBuf> {
+        let dir = self.cache_dir.path().join("ilert");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("openapi-"))
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
     /// Path to the profile config file the CLI reads.
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.path().join("ilert").join("config.json")
