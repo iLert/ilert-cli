@@ -236,6 +236,75 @@ check_contains "corrupted download: shows both digests" "expected" "$result"
 result=$(run_verify_checksum "${SUMS_DIR}/ilert_linux" "ilert_mac")
 check "asset absent from SHA256SUMS: rejected" "1" "${result##*__rc=}"
 
+# ---------------------------------------------------------------------------
+
+echo
+echo "resolve_install_target"
+
+# The target `ilert update` asks for wins over the script's own guess, because
+# the guess can name a different ilert than the one being replaced.
+run_resolve_target() {
+  ILERT_INSTALL_SH_LIB_ONLY=1 ILERT_INSTALL_URI="$1" bash -c '
+    . "$1" || exit 99
+    resolve_install_target "$2"
+  ' _ "$INSTALL_SH" "/usr/local/bin/ilert" 2>&1
+}
+
+result=$(run_resolve_target "/opt/custom/ilert")
+check "explicit target is used verbatim" "/opt/custom/ilert" "$result"
+
+# Unset, not empty: the fallback path has to keep working for a first install.
+result=$(ILERT_INSTALL_SH_LIB_ONLY=1 bash -c '
+  . "$1" || exit 99
+  PATH="/usr/bin:/bin"
+  HOME="/nonexistent-home"
+  resolve_install_target "$2"
+' _ "$INSTALL_SH" "/usr/local/bin/ilert" 2>&1)
+check "no explicit target falls back to the usual choice" "/usr/local/bin/ilert" "$result"
+
+result=$(run_resolve_target "relative/ilert"; printf '__rc=%s' "$?")
+check "a relative target is refused" "1" "${result##*__rc=}"
+check_contains "a relative target says why" "absolute path" "$result"
+
+result=$(run_resolve_target "$WORK_DIR"; printf '__rc=%s' "$?")
+check "a directory target is refused" "1" "${result##*__rc=}"
+check_contains "a directory target says why" "is a directory" "$result"
+
+# ---------------------------------------------------------------------------
+
+echo
+echo "install_binary"
+
+INSTALL_DIR="${WORK_DIR}/install"
+mkdir -p "$INSTALL_DIR"
+
+run_install_binary() {
+  ILERT_INSTALL_SH_LIB_ONLY=1 bash -c '
+    . "$1" || exit 99
+    install_binary "$2" "$3"
+  ' _ "$INSTALL_SH" "$1" "$2" 2>&1
+}
+
+printf 'new binary' > "${WORK_DIR}/new-binary"
+printf 'old binary' > "${INSTALL_DIR}/ilert"
+chmod 644 "${INSTALL_DIR}/ilert"
+
+run_install_binary "${WORK_DIR}/new-binary" "${INSTALL_DIR}/ilert" >/dev/null
+check "replaces the existing binary" "new binary" "$(cat "${INSTALL_DIR}/ilert")"
+
+# The mode is set on the staged file before the swap, so what lands at the
+# destination is executable the moment it is reachable — there is no second
+# step that can fail and leave it unrunnable.
+check "installed binary is executable" "yes" "$([ -x "${INSTALL_DIR}/ilert" ] && echo yes || echo no)"
+
+# Nothing may be left beside the destination: a stray `ilert.update.<pid>` in
+# /usr/local/bin is both confusing and, being executable, worth avoiding.
+leftovers=$(find "$INSTALL_DIR" -name 'ilert.update.*' | wc -l | tr -d ' ')
+check "no staged file is left behind" "0" "$leftovers"
+
+# The source is left alone, so the caller can still verify or reuse it.
+check "the downloaded file is not consumed" "new binary" "$(cat "${WORK_DIR}/new-binary")"
+
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

@@ -336,6 +336,12 @@ pub const STATIC_COMMANDS: &[(&str, Classification)] = &[
     // Local mutations.
     ("auth login", Classification::new(false, false, true)),
     ("auth logout", Classification::new(false, false, true)),
+    // Replaces this binary with the latest release. Not destructive in the
+    // sense the confirmation gate means — no server state changes and any
+    // version can be installed again — and repeating it lands on the same
+    // release. It has its own consent gate in `commands::update`, because what
+    // it needs to ask about is running the installer, not an API call.
+    ("update", Classification::new(false, false, true)),
     ("config import", Classification::new(false, false, true)),
     // Remote mutations.
     ("event send", Classification::new(false, false, false)),

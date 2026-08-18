@@ -26,6 +26,17 @@ cargo install --path .            # from source
 # for cross-compilation see XCOMPILE.md
 ```
 
+### Update
+
+```bash
+ilert update
+```
+
+Runs the installer that shipped inside the binary — same checksum and
+attestation checks as a fresh install, and no script fetched from a branch —
+and replaces the exact executable you invoked. It asks first, so add `--yes` to
+update unattended.
+
 ## Use
 
 ```bash

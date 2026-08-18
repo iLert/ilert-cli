@@ -3472,3 +3472,30 @@ async fn an_inherited_api_key_serves_the_profile_the_environment_selects() {
         .success()
         .stdout(predicate::str::contains("envuser"));
 }
+
+#[tokio::test]
+async fn update_refuses_to_run_the_installer_without_consent() {
+    let h = TestHarness::start().await;
+
+    // A test run is not a terminal, so this is the CI/agent path: the command
+    // replaces the binary that is running, and nothing here can answer a
+    // prompt. Refusing early also means the installer is never fetched.
+    h.cmd()
+        .args(["update"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+}
+
+#[tokio::test]
+async fn update_is_offered_alongside_the_other_static_commands() {
+    let h = TestHarness::start().await;
+
+    // The update notice tells people to run `ilert update`, so it has to be a
+    // command the help agrees exists.
+    h.cmd()
+        .args(["--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update"));
+}

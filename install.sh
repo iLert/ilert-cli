@@ -150,29 +150,43 @@ run_with_sudo_prompt() {
   esac
 }
 
-# Move binary to install path, escalating to sudo if needed
+# Put the new binary in place.
+#
+# The last step has to be a rename within one filesystem for the replacement to
+# be atomic, so the new binary is staged *beside* the destination rather than
+# moved in from the temp dir: /tmp is usually a different filesystem, which
+# silently turns `mv` into a copy — and a copy can be interrupted half-written,
+# over the binary that is running.
+#
+# The mode is set on the staged file, before anything can reach it by the real
+# name. Setting it afterwards made the install two steps that could each fail
+# separately: a chmod that failed after the move left the destination replaced
+# but not executable, and the caller was told the install had failed.
+#
+# After this function returns, either the old binary or the new one is at
+# `install_uri`, complete and executable. Never a partial file, never a file
+# without +x.
 install_binary() {
   local tmp_file="$1"
   local install_uri="$2"
+  local staged="${install_uri}.update.$$"
 
-  # Try to move without sudo. `--` throughout, so a path that starts with a
-  # dash is a path and not an option.
-  if mv -- "$tmp_file" "$install_uri" 2>/dev/null; then
-    :
-  else
-    run_with_sudo_prompt "Cannot write to '$install_uri' with current user permissions." \
-      mv -- "$tmp_file" "$install_uri"
+  # `sh -c` with the paths passed as positional parameters and never
+  # interpolated into the script text, so the code that runs — as root, on the
+  # sudo path — is this fixed string whatever the paths happen to contain.
+  local swap='cp -- "$1" "$2" && chmod -- 755 "$2" && mv -f -- "$2" "$3"'
+
+  if sh -c "$swap" sh "$tmp_file" "$staged" "$install_uri" 2>/dev/null; then
+    return 0
   fi
 
-  # Try to chmod without sudo. `--` goes before the mode, not after it: BSD
-  # chmod takes the first operand as the mode and would read a trailing `--` as
-  # a second file to change ("chmod: --: No such file or directory").
-  if chmod -- 755 "$install_uri" 2>/dev/null; then
-    :
-  else
-    run_with_sudo_prompt "Cannot update executable permissions for '$install_uri' with current user permissions." \
-      chmod -- 755 "$install_uri"
-  fi
+  # A staged file can survive a failure between the copy and the rename. It is
+  # removed by its full name, and a failure to remove it is not fatal — the
+  # sudo path below may be about to overwrite it anyway.
+  rm -f -- "$staged" 2>/dev/null || true
+
+  run_with_sudo_prompt "Cannot write to '$install_uri' with current user permissions." \
+    sh -c "$swap" sh "$tmp_file" "$staged" "$install_uri"
 }
 
 # Prefer ~/.local/bin if it exists in $PATH, creating it if needed
@@ -186,6 +200,41 @@ resolve_install_uri() {
   else
     echo "$fallback"
   fi
+}
+
+# Which binary this run replaces.
+#
+# `ilert update` sets ILERT_INSTALL_URI to the path of the executable that is
+# actually running, because the guesses below are guesses: a machine can hold
+# more than one ilert, and picking a different one would let an update report
+# success while the binary the caller invoked stayed exactly as it was.
+#
+# The path must be absolute — a relative one would resolve against whatever
+# directory this script happens to run in — and must not name a directory,
+# which would turn the install into a file created *inside* it.
+resolve_install_target() {
+  local fallback="$1"
+  local requested="${ILERT_INSTALL_URI:-}"
+
+  if [ -z "$requested" ]; then
+    resolve_install_uri "$fallback"
+    return 0
+  fi
+
+  case "$requested" in
+    /*) ;;
+    *)
+      echo "ILERT_INSTALL_URI must be an absolute path, got '${requested}'." >&2
+      return 1
+      ;;
+  esac
+
+  if [ -d "$requested" ]; then
+    echo "ILERT_INSTALL_URI '${requested}' is a directory, not a file." >&2
+    return 1
+  fi
+
+  echo "$requested"
 }
 
 # Everything above is a function definition; everything below installs. The
@@ -215,7 +264,7 @@ case "$(uname -s)" in
     # the same asset; the loader selects the matching slice.
     PLATFORM_LABEL="MacOS"
     ASSET="ilert_mac"
-    INSTALL_URI=$(resolve_install_uri "/usr/local/bin/ilert")
+    INSTALL_URI=$(resolve_install_target "/usr/local/bin/ilert") || exit 1
     ;;
   Linux*)
     case "$(uname -m)" in
@@ -236,7 +285,7 @@ case "$(uname -s)" in
         exit 1
         ;;
     esac
-    INSTALL_URI=$(resolve_install_uri "/usr/bin/ilert")
+    INSTALL_URI=$(resolve_install_target "/usr/bin/ilert") || exit 1
     ;;
   *)
     echo "Unsupported platform '$(uname -s)', please install manually."
@@ -274,4 +323,19 @@ verify_attestation "$TEMP_FILE"
 
 install_binary "$TEMP_FILE" "$INSTALL_URI"
 echo "Done"
-ilert --help
+
+# Run the binary that was just installed, by its full path.
+#
+# This is the line that proves the bytes we wrote actually execute on this
+# machine, so it has to run *that* file. A bare `ilert` would go through PATH
+# and could easily be a different installation — which would let an update that
+# replaced /usr/local/bin/ilert report the version of ~/.local/bin/ilert.
+#
+# `ilert update` re-runs this script, and the full help dumped over the caller's
+# terminal is the wrong ending for an update, so that path prints the version
+# the binary now reports instead.
+if [ -n "${ILERT_UPDATE:-}" ]; then
+  "$INSTALL_URI" version
+else
+  "$INSTALL_URI" --help
+fi

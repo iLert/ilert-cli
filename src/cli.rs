@@ -5,7 +5,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use colored::Colorize;
 
 use crate::classification::Classification;
-use crate::commands::{api, events, heartbeat, on_call, skills, status, version, watch};
+use crate::commands::{api, events, heartbeat, on_call, skills, status, update, version, watch};
 use crate::config::{ConfigManager, Profile, ResolvedConfig};
 use crate::errors::CliError;
 use crate::http::HttpClient;
@@ -154,6 +154,7 @@ const STATIC_COMMANDS: &[&str] = &[
     "on-call",
     "skills",
     "status",
+    "update",
     "version",
     "dashboard",
     "help",
@@ -293,6 +294,7 @@ impl Cli {
                     Ok(())
                 }
             },
+            Some(("update", sub)) => update::handle(sub, ctx).await,
             Some(("version", _)) => version::handle(ctx),
             Some(("dashboard", _)) => {
                 ctx.reject_jq("the dashboard", Some("'ilert status -o json'"))?;
@@ -1398,6 +1400,7 @@ fn build_command(index: &Option<OperationIndex>) -> Command {
         .subcommand(on_call::command())
         .subcommand(skills::command())
         .subcommand(status::command())
+        .subcommand(update::command())
         .subcommand(Command::new("version").about("Show version information"))
         .subcommand(Command::new("dashboard").about("Open interactive TUI dashboard"));
 

@@ -131,12 +131,17 @@ fn print_cli_update_notice(latest: &str) {
     eprintln!("{}", cli_update_notice(latest));
 }
 
+/// The notice names the command that acts on it. A version number on its own
+/// leaves the reader to work out how this binary was installed and what the
+/// matching upgrade is; `ilert update` answers that for every install path the
+/// installer owns, and tells the rest which manager owns them.
 fn cli_update_notice(latest: &str) -> String {
     format!(
-        "{} A new version of ilert is available: {} -> {}",
+        "{} A new version of ilert is available: {} -> {} — run {}",
         "Update:".cyan().bold(),
         current_version().dimmed(),
         terminal_text(latest).green().bold(),
+        "ilert update".bold(),
     )
 }
 
@@ -221,7 +226,9 @@ fn cached_api_version() -> Option<String> {
     read_spec_version(&spec_path)
 }
 
-fn check_file_path() -> Result<PathBuf> {
+/// Where the twelve-hour "latest vs current" result is cached. `update` deletes
+/// it after a successful install, since both halves of that comparison change.
+pub(crate) fn check_file_path() -> Result<PathBuf> {
     let cache_dir = ConfigManager::cache_dir()?;
     Ok(cache_dir.join(CHECK_FILE))
 }
@@ -267,7 +274,13 @@ mod tests {
     #[test]
     fn an_ordinary_notice_still_reads_normally() {
         let _colors = crate::testutil::colors(false);
-        assert!(cli_update_notice("2.1.0").ends_with("-> 2.1.0"));
+        assert_eq!(
+            cli_update_notice("2.1.0"),
+            format!(
+                "Update: A new version of ilert is available: {} -> 2.1.0 — run ilert update",
+                current_version()
+            )
+        );
         assert_eq!(
             api_update_notice("1.0.0", "1.1.0"),
             "Note: API spec updated: 1.0.0 -> 1.1.0"
