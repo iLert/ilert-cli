@@ -189,6 +189,16 @@ full response for `--debug`.
 Do not attempt to query features first — react to the error. When you need to know which tier includes a feature,
 that lives at <https://www.ilert.com/pricing>.
 
+### ICL and ITL inline fields
+
+ilert uses ICL (conditioning language) and ITL (templating language) for any optional customization options
+in their platform e.g. for alert source event processing or alert action filtering.
+
+- If you need to gather additional information about ICL it lives at <https://docs.ilert.com/developer-docs/icl-ilert-condition-language.md>
+- If you need to gather additional information about ITL it lives at <https://docs.ilert.com/developer-docs/itl-ilert-template-language.md>
+
+> Note these are rather large doc pages, so only fetch if needed and potentially pull them temporarily and search within them
+
 ### What the CLI treats as destructive
 
 A write is **not** destructive by default. `DELETE` is, plus a specific list that

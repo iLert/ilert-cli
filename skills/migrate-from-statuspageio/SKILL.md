@@ -13,7 +13,10 @@ The subscriber list does move — ilert has a dedicated import path that preserv
 existing consent — but only if you use it deliberately.
 
 For ilert's own semantics and the CLI behaviour behind a bulk import, read the
-`ilert-essentials` skill alongside this one.
+`ilert-essentials` skill alongside this one. Where Statuspage's own data lives —
+and how to hold a foreign API key while you read it — is under *Reading the
+Statuspage side* below; start there when the job is extraction rather than
+design.
 
 ## Status and communication are two separate objects
 
@@ -159,6 +162,90 @@ model, and it lands in one of two places: a `PRIVATE` page with an `ipWhitelist`
 or a public page scoped to the services you are content to show everyone. Choose
 per audience rather than globally — the identity-based page is the better answer
 wherever the viewers are known to you.
+
+## Reading the Statuspage side
+
+The Manage API is the export. It is also the API that hands you your customers'
+email addresses, so this extraction needs more care than the others.
+
+### The credential
+
+A Statuspage key belongs to a **user** and inherits that user's access to the
+pages in the organisation; there is no read-only variant, so read with it and
+write nothing.
+
+Keep it out of argv, and note that the obvious form does not:
+
+```
+curl -H "Authorization: OAuth $STATUSPAGE_API_KEY"   # the shell expands this first
+```
+
+The key is then a curl *argument*, readable by `ps` and by anything reading
+`/proc/<pid>/cmdline`, and the same line lands in shell history. Three transfers
+that actually hold:
+
+* **A config or header file the user writes once**, `chmod 600`, that you
+  reference by path and never open: `curl -K /path/to/sp.curlrc`, holding
+  `header = "Authorization: OAuth …"`. Or `curl -H @/path/to/sp-headers`.
+* **Through stdin**, when the value is already in the environment:
+  `printf 'Authorization: OAuth %s\n' "$STATUSPAGE_API_KEY" | curl -H @- …`.
+  `@-` reads headers from stdin, and `printf` is a shell builtin, so no process
+  gets the key in its argv. `curl -K -` takes a whole config the same way.
+* **A credential proxy** — `op run`, `vault exec`, `aws-vault exec` — which puts
+  the value in the child process's environment only. It fixes where the secret
+  lives, not how it reaches the request, so pair it with one of the two above.
+
+So an environment variable is a fine *carrier* — a script reading
+`os.environ["STATUSPAGE_API_KEY"]` itself never exposes it — but the transfer is
+what protects it. And do not `cat` the header file to check it: a secret that
+reaches the transcript is in everything derived from it afterwards. A leaked
+Statuspage key can post to your public page, so rotate it rather than hope.
+
+### The endpoints
+
+Base URL `https://api.statuspage.io/v1`. One header on every call:
+
+```
+Authorization: OAuth …
+```
+
+Everything except `GET /pages` is scoped by a `page_id`, so start there — it is
+also the cheap call that proves the key works.
+
+| What you are migrating | Where to read it |
+| --- | --- |
+| The page itself | `GET /pages` — appearance, subdomain, custom domain, visibility |
+| Components → services | `GET /pages/{page_id}/components?page=1&per_page=100` |
+| Component groups | `GET /pages/{page_id}/component-groups` |
+| Incidents and their updates | `GET /pages/{page_id}/incidents` (plus `/incidents/unresolved`) — each incident carries its `incident_updates` inline |
+| Scheduled maintenance | `GET /pages/{page_id}/incidents/scheduled` and `/incidents/upcoming` — maintenance is an incident with `scheduled_for` / `scheduled_until` |
+| Incident templates | `GET /pages/{page_id}/incident_templates` |
+| Subscribers | `GET /pages/{page_id}/subscribers?type=email&state=active&page=1&per_page=100` — repeat per `type`; see below before you run it |
+| Metrics | `GET /pages/{page_id}/metrics` and `GET /pages/{page_id}/metrics_providers` |
+| Audience-specific access | `GET /pages/{page_id}/page_access_users`, `GET /pages/{page_id}/page_access_groups` |
+| Embed / badge config | `GET /pages/{page_id}/status_embed_config` |
+
+### What will bite during extraction
+
+**The lazy call is the one that gets throttled.** The Manage API allows roughly
+60 requests per minute on a rolling window *for paginated requests* — but an
+**unpaginated** `GET` to `components` or `page_access_users` is limited to **one
+request per minute**. Always send `?page=1&per_page=100`, even for a page with
+three components; `page` is 1-based and `per_page` caps at 100. Rate-limited
+responses are `429` and carry `Retry-After`: honour it rather than guessing.
+
+**Subscriber data is personal data, and it is the one export you must not read.**
+Write it straight to a file, count the rows, and hand the file to ilert's
+`subscribers_bulk?import=true` path. Do not print it into the conversation, do not
+summarise individual addresses, and do not leave it in the repo when you are done.
+Export only the states you actually intend to import — importing an unconfirmed or
+stale subscriber as confirmed is a consent decision, not a data-format decision.
+
+**Extract once, to files, then work from the files.** One JSON file per collection
+is cheaper, reproducible and reviewable, and with a 60-per-minute budget it is
+also the difference between a five-minute extraction and an afternoon. Keep the
+files beside the Statuspage ID → ilert ID map, and query them with `jq` rather
+than re-fetching.
 
 ## Order of migration
 

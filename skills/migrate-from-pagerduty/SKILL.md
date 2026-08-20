@@ -11,7 +11,9 @@ collisions cause most migration defects, and neither is visible from the API
 spec.
 
 For ilert's own semantics and the CLI behaviour behind a bulk import, read the
-`ilert-essentials` skill alongside this one.
+`ilert-essentials` skill alongside this one. Where PagerDuty's own data lives —
+and how to hold a foreign API key while you read it — is under *Reading the
+PagerDuty side* below; start there when the job is extraction rather than design.
 
 ## The two traps
 
@@ -282,6 +284,102 @@ at your carrier and forward it.
 
 Beyond those two points, call flows are highly configurable and cover the routing
 patterns a PD live-call setup is likely to need.
+
+## Reading the PagerDuty side
+
+Nothing here is exported for you. The PagerDuty REST API *is* the export, so the
+first half of any migration is a read job against a foreign account — with a
+foreign credential you should be careful with.
+
+### The credential
+
+Ask for a **read-only** key; extraction never writes. Then keep it out of argv —
+and note that the obvious form does not:
+
+```
+curl -H "Authorization: Token token=$PD_TOKEN"   # the shell expands this first
+```
+
+The token is then a curl *argument*, readable by `ps` and by anything reading
+`/proc/<pid>/cmdline`, and the same line lands in shell history. Three transfers
+that actually hold:
+
+* **A config or header file the user writes once**, `chmod 600`, that you
+  reference by path and never open: `curl -K /path/to/pd.curlrc`, holding
+  `header = "Authorization: Token token=…"` and the `Accept` line beside it. Or
+  `curl -H @/path/to/pd-headers`.
+* **Through stdin**, when the value is already in the environment:
+  `printf 'Authorization: Token token=%s\n' "$PD_TOKEN" | curl -H @- …`. `@-`
+  reads headers from stdin, and `printf` is a shell builtin, so no process gets
+  the token in its argv. `curl -K -` takes a whole config the same way.
+* **A credential proxy** — `op run`, `vault exec`, `aws-vault exec` — which puts
+  the value in the child process's environment only. It fixes where the secret
+  lives, not how it reaches the request, so pair it with one of the two above.
+
+So an environment variable is a fine *carrier* — a script reading
+`os.environ["PD_TOKEN"]` itself never exposes it — but the transfer is what
+protects it. And do not `cat` the header file to check it: a secret that reaches
+the transcript is in everything derived from it afterwards, and rotating the key
+is then the only real fix.
+
+### The endpoints
+
+Base URL `https://api.pagerduty.com`, or `https://api.eu.pagerduty.com` for an
+account in the EU service region — the same split decides whether events go to
+`events.pagerduty.com` or `events.eu.pagerduty.com`, which matters again at
+cutover. Two headers on every call:
+
+```
+Authorization: Token token=…
+Accept: application/vnd.pagerduty+json;version=2
+```
+
+The `Accept` version header is easy to forget and quietly changes response
+shapes. Verify the key with one cheap call — `GET /abilities` — before building
+anything on top of it.
+
+| What you are migrating | Where to read it |
+| --- | --- |
+| Users, contact methods, notification rules | `GET /users?include[]=contact_methods&include[]=notification_rules` — the includes avoid an N+1 across the whole directory |
+| Teams and membership | `GET /teams`, then `GET /teams/{id}/members` — the role lives on the membership, not on the user |
+| Escalation policies | `GET /escalation_policies?include[]=targets` |
+| Schedules | `GET /schedules` lists names only; `GET /schedules/{id}` carries `schedule_layers`, and `since` / `until` render the actual entries |
+| Overrides | `GET /schedules/{id}/overrides?since=…&until=…` — the window is required, and only future overrides are worth recreating |
+| Alert sources | `GET /services?include[]=integrations` — one call gives you the service settings and its integrations |
+| Event Orchestrations | `GET /event_orchestrations`, `GET /event_orchestrations/{id}/router` for the global router, `GET /event_orchestrations/services/{service_id}` for the per-service one — three separate reads, and a setup can use all three |
+| Legacy event rules | `GET /rulesets`, `GET /rulesets/{id}/rules` — older accounts still have these instead |
+| Business services | `GET /business_services` |
+| Maintenance windows | `GET /maintenance_windows?filter=…` — pass the filter deliberately; you want ongoing and future windows, not the archive |
+| Outbound automation | `GET /extensions` **and** `GET /webhook_subscriptions` — v2 extensions and v3 webhooks are different collections, and reading only one silently drops half the alert actions |
+| Response plays / workflows | `GET /response_plays`, `GET /incident_workflows` |
+| Priorities | `GET /priorities` — the source of truth for the P1–P5 → `SEV1`–`SEV5` mapping |
+| Alert history | `GET /incidents?since=…&until=…&statuses[]=…`, then `GET /incidents/{id}/alerts` |
+| Integration types | `GET /vendors` — the vendor on a PD integration is what tells you which ilert `integrationType` to pick |
+| Coverage check | `GET /oncalls?since=…&until=…` — run it on both systems after import and compare |
+
+### What will bite during extraction
+
+**Offset paging has a ceiling.** `limit` maxes at 100 (default 25) and
+`limit + offset` must stay at or below 10,000, so a large `/incidents` history
+cannot be paged through to the end. Window it by `since` / `until` instead. Some
+newer collections — incident workflows, audit records — page by `cursor` rather
+than offset, and `total` is only returned if you ask for it with `total=true`.
+
+**PagerDuty tells you about rate limits; use that.** The limit is on the order of
+960 requests per minute per key, and unlike ilert the responses carry
+`ratelimit-limit`, `ratelimit-remaining` and `ratelimit-reset`. Pace off those
+headers rather than sleeping blindly.
+
+**The dumps contain credentials.** A service's `integrations` carry live
+`integration_key` values — those are the keys the old emitters are still using.
+Treat the extraction files as secret material: keep them out of the repo, out of
+any commit, and out of your context window. There is no reason to print them.
+
+**Extract once, to files, then work from the files.** One JSON file per
+collection is cheaper, reproducible and reviewable, and it stops you re-paging a
+collection for every mapping question. Keep them beside the PagerDuty ID → ilert
+ID map that the migration order below depends on, and query them with `jq` rather
+than pasting them around.
 
 ## Order of migration
 

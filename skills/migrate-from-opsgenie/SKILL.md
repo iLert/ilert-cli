@@ -11,6 +11,11 @@ alerts through different objects. Opsgenie routes **team-first**; ilert routes
 **source-first**. A simple setup maps one-to-one, but any configuration that
 leaned on team routing rules routes differently after a faithful field-by-field import.
 
+For ilert's own semantics and the CLI behaviour behind a bulk import, read the
+`ilert-essentials` skill alongside this one. Where Opsgenie's own data lives — and
+how to hold a foreign API key while you read it — is under *Reading the Opsgenie
+side* below; start there when the job is extraction rather than design.
+
 ## The routing model difference
 
 In Opsgenie an integration hands an alert to a **team**, and the team's routing
@@ -297,6 +302,107 @@ wait folded into a rule timeout, or it repeats sooner than it used to.
 Check also for `repeat.resetRecipientStates`, which clears acknowledgement on
 every pass and so keeps paging people who had already acked. ilert has no
 equivalent — `ACCEPTED` stops escalation.
+
+## Reading the Opsgenie side
+
+There is no bulk export. The Opsgenie API *is* the export, so the first half of
+the migration is a read job against a foreign account — with a foreign credential
+you should be careful with. Do it early: Opsgenie is being wound down by
+Atlassian, and a dump on disk keeps working when the source account does not.
+
+### The credential
+
+Opsgenie keys carry their own access rights, and a key created on an API
+integration to raise alerts sees none of the configuration you came for. Ask for
+one with **read and configuration access**, and nothing more — extraction never
+writes.
+
+Then keep it out of argv, and note that the obvious form does not:
+
+```
+curl -H "Authorization: GenieKey $OPSGENIE_API_KEY"   # the shell expands this first
+```
+
+The key is then a curl *argument*, readable by `ps` and by anything reading
+`/proc/<pid>/cmdline`, and the same line lands in shell history. Three transfers
+that actually hold:
+
+* **A config or header file the user writes once**, `chmod 600`, that you
+  reference by path and never open: `curl -K /path/to/og.curlrc`, holding
+  `header = "Authorization: GenieKey …"`. Or `curl -H @/path/to/og-headers`.
+* **Through stdin**, when the value is already in the environment:
+  `printf 'Authorization: GenieKey %s\n' "$OPSGENIE_API_KEY" | curl -H @- …`.
+  `@-` reads headers from stdin, and `printf` is a shell builtin, so no process
+  gets the key in its argv. `curl -K -` takes a whole config the same way.
+* **A credential proxy** — `op run`, `vault exec`, `aws-vault exec` — which puts
+  the value in the child process's environment only. It fixes where the secret
+  lives, not how it reaches the request, so pair it with one of the two above.
+
+So an environment variable is a fine *carrier* — a script reading
+`os.environ["OPSGENIE_API_KEY"]` itself never exposes it — but the transfer is
+what protects it. And do not `cat` the header file to check it: a secret that
+reaches the transcript is in everything derived from it afterwards, and rotating
+the key is then the only real fix.
+
+### The endpoints
+
+Base URL `https://api.opsgenie.com`, or `https://api.eu.opsgenie.com` for an
+account on the EU instance — a key from one region simply fails against the
+other, which reads like a bad key rather than a wrong host. One header on every
+call:
+
+```
+Authorization: GenieKey …
+```
+
+Verify it with one cheap call — `GET /v2/account` — before building anything on
+top of it. Mind the version prefixes: most resources are `/v2`, but **services
+and incidents are `/v1`**, and calling the wrong one 404s in a way that looks
+like "it isn't there".
+
+| What you are migrating | Where to read it |
+| --- | --- |
+| Users and contacts | `GET /v2/users?expand=contact` — the expand avoids an N+1 across the directory |
+| Notification rules | `GET /v2/users/{id}/notification-rules`, then the rule detail for its steps — per user, with no bulk endpoint; budget for the N+1 here |
+| Teams and members | `GET /v2/teams`, then `GET /v2/teams/{id}` — members come with the team detail |
+| Team routing rules | `GET /v2/teams/{id}/routing-rules` — the object with no ilert equivalent; read all of them before deciding on sources and flows |
+| Escalations | `GET /v2/escalations` |
+| Schedules and rotations | `GET /v2/schedules?expand=rotation` — without the expand you get names and nothing else |
+| Overrides | `GET /v2/schedules/{id}/overrides` |
+| Forwarding rules | `GET /v2/forwarding-rules` — easily forgotten, and they become schedule overrides |
+| Alert sources | `GET /v2/integrations`, then `GET /v2/integrations/{id}` for the type and owning team |
+| Alert policies | `GET /v2/policies/alert` for global ones, and again with `?teamId=…` **per team** — separate lists, and skipping the team pass loses most of them |
+| Notification policies | `GET /v2/policies/notification?teamId=…` — `teamId` is required, so this one is per team by definition |
+| Services | `GET /v1/services` |
+| Incidents and their rules | `GET /v1/incidents`, `GET /v1/services/{id}/incident-rules`, `GET /v1/incident-templates` |
+| Heartbeats | `GET /v2/heartbeats` |
+| Maintenance | `GET /v2/maintenance?type=…` — pass the filter deliberately; the default does not give you everything |
+| Custom user roles | `GET /v2/custom-user-roles` |
+| Alert history | `GET /v2/alerts?query=…&sort=createdAt&order=asc`, then `/v2/alerts/{id}`, `/notes`, `/logs` for detail |
+| Coverage check | `GET /v2/schedules/{id}/on-calls?flat=true` — run it on both systems after import and compare |
+
+### What will bite during extraction
+
+**Follow `paging.next`, do not increment `offset` yourself.** `limit` maxes at
+100 (default 20) and every list response carries absolute `paging.next` / `first`
+/ `last` URLs. The alert search in particular refuses to page arbitrarily deep, so
+when it stops, window by `createdAt` in the `query` instead of pushing the offset
+further.
+
+**Rate limits are per key and per endpoint family**, and configuration reads are
+counted separately from alert traffic. There is no reliable budget to plan
+against — treat `429` as the pacing signal and back off on it.
+
+**The dumps contain credentials.** Integration objects and anything key-shaped in
+them are the keys your old emitters are still using. Treat the extraction files as
+secret material: out of the repo, out of any commit, out of your context window.
+There is no reason to print them.
+
+**Extract once, to files, then work from the files.** One JSON file per
+collection is cheaper, reproducible and reviewable, and it stops you re-paging a
+collection for every mapping question. Keep them beside the Opsgenie ID → ilert ID
+map that the migration order below depends on, and query them with `jq` rather
+than pasting them around.
 
 ## Order of migration
 
