@@ -150,6 +150,48 @@ run_with_sudo_prompt() {
   esac
 }
 
+# Whether a failed install attempt is something sudo could actually fix.
+#
+# Everything the swap below does — creating the install directory, writing the
+# staged file, renaming it over the destination — needs write *and* search
+# permission on the closest directory that already exists, and nothing else. So
+# that is what is asked, rather than pattern-matching an error message that
+# changes with the platform and the locale.
+#
+# Offering sudo for a failure it cannot fix is worse than not offering it: a
+# fresh macOS has no /usr/local/bin, the resulting "No such file or directory"
+# was reported to the user as a permissions problem, and typing a password
+# produced the identical error a second time.
+install_needs_privileges() {
+  local dir="$1"
+
+  # `dirname /` is `/`, which is the only way this terminates when nothing on
+  # the path exists. Written as an `if` rather than `[ ... ] && break`, which
+  # under `set -e` fails the whole list on the common iteration and takes the
+  # script with it.
+  while [ ! -e "$dir" ]; do
+    local parent
+    parent=$(dirname -- "$dir")
+    if [ "$parent" = "$dir" ]; then
+      break
+    fi
+    dir="$parent"
+  done
+
+  # Not a directory at all (a regular file sitting at /usr/local/bin, say) is
+  # also nothing sudo can help with, and the real error says so far better than
+  # a password prompt would.
+  #
+  # Write permission alone is not enough to create an entry in a directory: the
+  # search bit has to be there too. A mode-0600 ancestor is writable by `test -w`
+  # and still refuses `mkdir` with "Permission denied" — a refusal sudo does fix,
+  # so checking only -w would send the user away with a bare error instead.
+  if [ ! -d "$dir" ]; then
+    return 1
+  fi
+  [ ! -w "$dir" ] || [ ! -x "$dir" ]
+}
+
 # Put the new binary in place.
 #
 # The last step has to be a rename within one filesystem for the replacement to
@@ -170,13 +212,36 @@ install_binary() {
   local tmp_file="$1"
   local install_uri="$2"
   local staged="${install_uri}.update.$$"
+  local install_dir
+  install_dir=$(dirname -- "$install_uri")
 
+  # A directory where the binary belongs is not a previous installation, and
+  # `mv -f` will not replace it: it moves the staged file *inside* it and
+  # reports success. That left an `ilert.update.<pid>` buried in a directory
+  # named `ilert`, an install that claimed to have worked, and nothing runnable
+  # on PATH. `resolve_install_target` rejects this for an explicit
+  # ILERT_INSTALL_URI; the default paths reach here without that check.
+  if [ -d "$install_uri" ]; then
+    echo "'${install_uri}' is a directory, not the ilert binary."
+    echo "Remove it and run the installer again."
+    exit 1
+  fi
+
+  # `mkdir -p` is part of the swap so that a missing install directory is
+  # created by whichever attempt gets that far — including the sudo one, which
+  # is the case that matters, since a user who cannot write /usr/local/bin
+  # cannot create it either.
+  #
   # `sh -c` with the paths passed as positional parameters and never
   # interpolated into the script text, so the code that runs — as root, on the
   # sudo path — is this fixed string whatever the paths happen to contain.
-  local swap='cp -- "$1" "$2" && chmod -- 755 "$2" && mv -f -- "$2" "$3"'
+  local swap='mkdir -p -- "$4" && cp -- "$1" "$2" && chmod -- 755 "$2" && mv -f -- "$2" "$3"'
 
-  if sh -c "$swap" sh "$tmp_file" "$staged" "$install_uri" 2>/dev/null; then
+  # The first attempt's stderr is kept rather than discarded: it is the only
+  # account of why the install failed, and it is what the user is shown when
+  # sudo is not the answer.
+  local err
+  if err=$(LC_ALL=C sh -c "$swap" sh "$tmp_file" "$staged" "$install_uri" "$install_dir" 2>&1); then
     return 0
   fi
 
@@ -185,8 +250,27 @@ install_binary() {
   # sudo path below may be about to overwrite it anyway.
   rm -f -- "$staged" 2>/dev/null || true
 
-  run_with_sudo_prompt "Cannot write to '$install_uri' with current user permissions." \
-    sh -c "$swap" sh "$tmp_file" "$staged" "$install_uri"
+  if ! install_needs_privileges "$install_dir"; then
+    echo "Failed to install to '${install_uri}'."
+    if [ -n "$err" ]; then
+      echo "  ${err}"
+    fi
+    exit 1
+  fi
+
+  if run_with_sudo_prompt "Cannot write to '${install_uri}' with current user permissions." \
+    sh -c "$swap" sh "$tmp_file" "$staged" "$install_uri" "$install_dir"; then
+    return 0
+  fi
+
+  # The privileged attempt can leave a root-owned staged file behind the same
+  # way the unprivileged one can, and that one the user cannot delete without
+  # sudo of their own. `sudo -n` so a cleanup never turns into a second,
+  # unexplained password prompt; if the credentials have already expired the
+  # file simply stays, which is what would have happened anyway.
+  rm -f -- "$staged" 2>/dev/null || sudo -n rm -f -- "$staged" 2>/dev/null || true
+  echo "Failed to install to '${install_uri}' even with administrator privileges."
+  exit 1
 }
 
 # Prefer ~/.local/bin if it exists in $PATH, creating it if needed

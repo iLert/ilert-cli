@@ -273,6 +273,51 @@ check_contains "a directory target says why" "is a directory" "$result"
 # ---------------------------------------------------------------------------
 
 echo
+echo "install_needs_privileges"
+
+run_needs_privileges() {
+  ILERT_INSTALL_SH_LIB_ONLY=1 bash -c '
+    . "$1" || exit 99
+    if install_needs_privileges "$2"; then echo yes; else echo no; fi
+  ' _ "$INSTALL_SH" "$1" 2>&1
+}
+
+PERM_DIR="${WORK_DIR}/perm"
+mkdir -p "${PERM_DIR}/ok"
+check "a writable, searchable directory needs no privileges" "no" "$(run_needs_privileges "${PERM_DIR}/ok")"
+
+# The nearest *existing* ancestor is the one that decides, so a whole missing
+# subtree under a usable directory is not a permissions problem.
+check "a missing directory under a writable parent needs no privileges" "no" "$(run_needs_privileges "${PERM_DIR}/ok/a/b/c")"
+
+# root ignores the permission bits entirely, so these three prove nothing there.
+if [ "$(id -u)" = "0" ]; then
+  echo "  skip permission-bit checks (running as root)"
+else
+  mkdir -p "${PERM_DIR}/unwritable"
+  chmod 555 "${PERM_DIR}/unwritable"
+  check "an unwritable directory needs privileges" "yes" "$(run_needs_privileges "${PERM_DIR}/unwritable")"
+
+  # Write permission alone does not let you create an entry: without the search
+  # bit `mkdir` fails with "Permission denied". `test -w` says such a directory
+  # is writable, so checking only -w declared this a failure sudo could not fix
+  # and dropped the user at a bare error instead of the prompt that would have
+  # worked.
+  mkdir -p "${PERM_DIR}/unsearchable"
+  chmod 600 "${PERM_DIR}/unsearchable"
+  check "a writable but unsearchable directory needs privileges" "yes" "$(run_needs_privileges "${PERM_DIR}/unsearchable")"
+
+  # The same directory reached as an ancestor: nothing below it exists, and
+  # nothing below it can be created without privileges either.
+  check "an inaccessible ancestor needs privileges" "yes" "$(run_needs_privileges "${PERM_DIR}/unsearchable/bin")"
+
+  # Left as they are, these defeat the cleanup trap.
+  chmod 755 "${PERM_DIR}/unwritable" "${PERM_DIR}/unsearchable"
+fi
+
+# ---------------------------------------------------------------------------
+
+echo
 echo "install_binary"
 
 INSTALL_DIR="${WORK_DIR}/install"
@@ -304,6 +349,41 @@ check "no staged file is left behind" "0" "$leftovers"
 
 # The source is left alone, so the caller can still verify or reuse it.
 check "the downloaded file is not consumed" "new binary" "$(cat "${WORK_DIR}/new-binary")"
+
+# A first install on a machine that has never had one: on a fresh macOS there
+# is no /usr/local/bin, and `cp` failed there with "No such file or directory"
+# — which the installer then offered to fix with sudo, twice, to no effect.
+MISSING_DIR="${WORK_DIR}/missing/deeper/bin"
+run_install_binary "${WORK_DIR}/new-binary" "${MISSING_DIR}/ilert" >/dev/null
+check "creates the install directory when it does not exist" "new binary" "$(cat "${MISSING_DIR}/ilert" 2>&1)"
+check "binary installed into a created directory is executable" "yes" "$([ -x "${MISSING_DIR}/ilert" ] && echo yes || echo no)"
+
+# `mv -f` moves into a directory destination rather than replacing it, so this
+# case used to "succeed" while leaving the staged file inside `ilert/` and
+# nothing runnable at the install path.
+DIR_TARGET="${INSTALL_DIR}/dir-target"
+mkdir -p "${DIR_TARGET}/ilert"
+result=$(run_install_binary "${WORK_DIR}/new-binary" "${DIR_TARGET}/ilert"; printf '__rc=%s' "$?")
+check "a directory at the install path is refused" "1" "${result##*__rc=}"
+check_contains "a directory at the install path says why" "is a directory" "$result"
+leftovers=$(find "${DIR_TARGET}/ilert" -type f | wc -l | tr -d ' ')
+check "nothing is moved inside the directory" "0" "$leftovers"
+
+# Only a failure sudo could actually fix may produce a sudo prompt. Here the
+# install directory cannot be created because a regular file is in the way,
+# which no amount of privilege changes — the real error is what helps.
+printf 'not a directory' > "${WORK_DIR}/blocking-file"
+result=$(run_install_binary "${WORK_DIR}/new-binary" "${WORK_DIR}/blocking-file/ilert" </dev/null; printf '__rc=%s' "$?")
+check "a non-permission failure is fatal" "1" "${result##*__rc=}"
+check_contains "a non-permission failure reports the real error" "Failed to install" "$result"
+if printf '%s' "$result" | grep -qF "administrator privileges"; then
+  FAILED=$((FAILED + 1))
+  printf '  FAIL %s\n' "a non-permission failure does not offer sudo"
+  printf '         actual output: %s\n' "$result"
+else
+  PASSED=$((PASSED + 1))
+  printf '  ok   %s\n' "a non-permission failure does not offer sudo"
+fi
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"
