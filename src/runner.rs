@@ -482,29 +482,14 @@ fn upsert_query(query: &mut Vec<(String, String)>, key: &str, value: &str) {
 }
 
 fn extract_page_items(value: &Value) -> Vec<Value> {
-    // Direct array
-    if let Some(arr) = value.as_array() {
-        return arr.clone();
+    // Same notion of "this response is a list" the renderer uses, so a page
+    // that prints as one row is also counted as one row. Nested arrays inside
+    // a single record are not a page of anything.
+    match crate::output::collection_items(value) {
+        Some(items) => items.into_iter().cloned().collect(),
+        // Single item or non-array response.
+        None => vec![value.clone()],
     }
-    // Common wrapper fields
-    for key in &["items", "results", "data"] {
-        if let Some(arr) = value.get(key).and_then(|v| v.as_array()) {
-            return arr.clone();
-        }
-    }
-    // Any array field containing objects
-    if let Some(obj) = value.as_object() {
-        for (_, v) in obj {
-            if let Some(arr) = v.as_array()
-                && !arr.is_empty()
-                && arr[0].is_object()
-            {
-                return arr.clone();
-            }
-        }
-    }
-    // Single item or non-array response
-    vec![value.clone()]
 }
 
 fn build_body(

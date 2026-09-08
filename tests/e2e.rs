@@ -118,6 +118,47 @@ async fn auth_whoami_calls_current_user() {
         .stdout(predicate::str::contains("testuser"));
 }
 
+/// Regression: a user whose account has notification preferences set had them
+/// printed as the whole table — three rows of delay and method — while the user
+/// the command was asked about vanished. Any nested list of objects used to be
+/// taken as the response payload, so whether `whoami` worked depended on
+/// whether the account happened to have preferences configured.
+#[tokio::test]
+async fn auth_whoami_table_shows_the_user_not_a_nested_list() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "username": "testuser",
+            "email": "test@ilert.com",
+            "firstName": "Test",
+            "lastName": "User",
+            "mobile": {"number": "+490000000000", "regionCode": "DE"},
+            "notificationPreferences": [
+                {"delay": 0, "method": "EMAIL"},
+                {"delay": 0, "method": "SMS"},
+                {"delay": 0, "method": "VOICE_MOBILE"},
+            ],
+        })))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args(["auth", "whoami", "--api-key", "my-api-key", "-o", "table"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("test@ilert.com")
+                .and(predicate::str::contains("testuser"))
+                // The nested list is summarized in place, never promoted to
+                // rows of its own.
+                .and(predicate::str::contains("[3 items]"))
+                .and(predicate::str::contains("VOICE_MOBILE").not()),
+        );
+}
+
 #[tokio::test]
 async fn auth_logout_removes_key() {
     let h = TestHarness::start().await;

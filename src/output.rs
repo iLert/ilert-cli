@@ -68,7 +68,7 @@ fn print_json(value: &Value) {
 }
 
 fn print_ndjson(value: &Value) {
-    if let Some(items) = extract_items(value) {
+    if let Some(items) = collection_items(value) {
         for item in items {
             println!("{}", serde_json::to_string(item).unwrap_or_default());
         }
@@ -83,7 +83,7 @@ fn print_raw(value: &Value) {
 }
 
 fn print_table(value: &Value, fields: Option<&[String]>) {
-    let items = match extract_items(value) {
+    let items = match collection_items(value) {
         Some(items) if !items.is_empty() => items,
         _ => {
             if let Some(obj) = value.as_object() {
@@ -245,29 +245,40 @@ fn format_timestamp(value: &str) -> String {
 // Item extraction & column selection
 // ---------------------------------------------------------------------------
 
-fn extract_items(value: &Value) -> Option<Vec<&Value>> {
+/// The rows of a collection response, or `None` when the response is a single
+/// thing and should be rendered as one.
+pub(crate) fn collection_items(value: &Value) -> Option<Vec<&Value>> {
     if let Some(arr) = value.as_array() {
         return Some(arr.iter().collect());
     }
 
-    for key in &["items", "results", "data"] {
-        if let Some(arr) = value.get(key).and_then(|v| v.as_array()) {
-            return Some(arr.iter().collect());
-        }
-    }
+    value
+        .as_object()
+        .and_then(envelope_array)
+        .map(|arr| arr.iter().collect())
+}
 
-    if let Some(obj) = value.as_object() {
-        for (_, v) in obj {
-            if let Some(arr) = v.as_array()
-                && !arr.is_empty()
-                && arr[0].is_object()
-            {
-                return Some(arr.iter().collect());
-            }
-        }
-    }
-
-    None
+/// The list inside a collection envelope, or `None` when the object is a
+/// resource rather than a wrapper around a list.
+///
+/// The distinction matters because a resource carries arrays of its own and
+/// those are not rows. `auth whoami` printed a table of the account's
+/// notification preferences and dropped the user entirely: the old code took
+/// *any* non-empty array of objects as the payload, and
+/// `notificationPreferences` was the first one on the user. Accounts that had
+/// set no preferences rendered correctly, which is why it stayed hidden.
+///
+/// So an envelope now has to name its list. Guessing from shape instead is what
+/// caused the bug, and it fails silently in the worst direction: the response
+/// the user asked for disappears and something nested inside it takes its
+/// place. Every ilert list endpoint returns a bare JSON array anyway, so these
+/// three keys are tolerance for wrappers we might meet, not a description of
+/// the API. A wrapper under some other key renders as a single record with a
+/// `[n items]` cell — plainly odd, but it never hides the response.
+fn envelope_array(obj: &serde_json::Map<String, Value>) -> Option<&Vec<Value>> {
+    ["items", "results", "data"]
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(|v| v.as_array()))
 }
 
 fn select_columns(items: &[&Value]) -> Vec<String> {
@@ -496,6 +507,76 @@ mod tests {
             widths.windows(2).all(|w| w[0] == w[1]),
             "misaligned table rows: {widths:?}\n{rendered}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection vs. single record
+    // -----------------------------------------------------------------------
+
+    /// The `auth whoami` payload, trimmed to the keys that matter here.
+    fn current_user() -> Value {
+        json!({
+            "id": 1,
+            "username": "testuser",
+            "email": "test@ilert.com",
+            "firstName": "Test",
+            "mobile": {"number": "+490000000000", "regionCode": "DE"},
+            "lowPriorityNotificationPreferences": [],
+            "notificationPreferences": [
+                {"delay": 0, "method": "EMAIL"},
+                {"delay": 0, "method": "SMS"},
+                {"delay": 0, "method": "VOICE_MOBILE"},
+            ],
+        })
+    }
+
+    #[test]
+    fn a_record_is_not_a_collection_because_it_contains_one() {
+        // The reported bug: `auth whoami` rendered a three-row table of delay
+        // and method columns, and the user it was asked about was nowhere in
+        // the output. An account with no notification preferences set printed
+        // correctly, so the shape of the data decided whether the command
+        // worked.
+        assert!(collection_items(&current_user()).is_none());
+    }
+
+    #[test]
+    fn a_record_renders_its_own_fields() {
+        let user = current_user();
+        let obj = user.as_object().unwrap();
+        assert_eq!(format_cell(obj.get("email")), "test@ilert.com");
+        // Nested structure is summarized in place rather than replacing the
+        // record it belongs to.
+        assert_eq!(format_cell(obj.get("notificationPreferences")), "[3 items]");
+        assert_eq!(format_cell(obj.get("mobile")), "{...}");
+    }
+
+    #[test]
+    fn a_bare_array_is_a_collection() {
+        // Every ilert list endpoint answers in this shape.
+        let alerts = json!([{"id": 1}, {"id": 2}]);
+        let items = collection_items(&alerts).expect("array is a collection");
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn a_named_envelope_is_a_collection() {
+        for key in ["items", "results", "data"] {
+            let body = json!({key: [{"id": 1}], "totalCount": 1});
+            let items = collection_items(&body)
+                .unwrap_or_else(|| panic!("'{key}' envelope should be a collection"));
+            assert_eq!(items.len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_empty_named_envelope_is_still_a_collection() {
+        // Extraction only: an empty page is still a page. `print_ndjson` prints
+        // nothing for it rather than one line describing the wrapper.
+        // `print_table` is the exception — it treats an empty list as nothing to
+        // tabulate and falls back to the envelope's own fields.
+        let body = json!({"items": [], "totalCount": 0});
+        assert_eq!(collection_items(&body).map(|i| i.len()), Some(0));
     }
 
     // -----------------------------------------------------------------------
