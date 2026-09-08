@@ -224,6 +224,41 @@ pub fn dry_run(
     envelope(STATUS_DRY_RUN, operation, classification, request)
 }
 
+/// A refusal for a command that changes this machine rather than sending a
+/// request.
+///
+/// The top-level shape is [`refusal`]'s, so a caller that already parses the
+/// envelope reads this one unchanged: same `status`, same `operation`, same
+/// `confirmation` block. `request` is null because there is no request, and
+/// `target` names the local state that would have changed instead.
+///
+/// `target` is redacted like a request body. Nothing that describes a profile
+/// should be a secret in the first place, but this envelope is printed into the
+/// same CI logs and support tickets the others are, and the redactor is the one
+/// place that decides what may appear there.
+pub fn local_refusal(
+    operation: &OperationRef,
+    classification: Classification,
+    target: &Value,
+) -> Value {
+    let mut value = envelope(
+        STATUS_CONFIRMATION_REQUIRED,
+        operation,
+        classification,
+        &RequestPreview {
+            method: String::new(),
+            url: String::new(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            body: None,
+        },
+    );
+    value["request"] = Value::Null;
+    value["target"] = redact_body(target);
+    value["confirmation"]["required"] = Value::Bool(true);
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +423,51 @@ mod tests {
 
         let value = refusal(&sample_op(), read_only, &sample_request());
         assert_eq!(value["confirmation"]["required"], Value::Bool(true));
+    }
+
+    /// A local refusal is the request refusal minus the request. A caller that
+    /// already reads `status` and `confirmation` must not have to learn a second
+    /// shape to find out that its `config delete` was refused.
+    #[test]
+    fn a_local_refusal_keeps_the_envelope_a_caller_already_parses() {
+        let c = Classification::new(false, true, true);
+        let op = OperationRef::new("config delete")
+            .with_description(Some("Delete profile 'staging'".into()));
+        let value = local_refusal(&op, c, &serde_json::json!({ "profile": "staging" }));
+
+        assert_eq!(value["status"], STATUS_CONFIRMATION_REQUIRED);
+        assert_eq!(value["confirmation"]["required"], Value::Bool(true));
+        assert_eq!(value["confirmation"]["flag"], CONFIRM_FLAG);
+        assert_eq!(value["operation"]["command"], "config delete");
+        assert_eq!(value["classification"]["destructive"], Value::Bool(true));
+
+        // Null rather than an empty request: there is no request, and a caller
+        // reading `request.method` should find nothing instead of "".
+        assert_eq!(value["request"], Value::Null);
+        assert_eq!(value["target"]["profile"], "staging");
+
+        // Every key the request refusal has, plus `target`.
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        for key in keys(&refusal(&op, c, &sample_request())) {
+            assert!(keys(&value).contains(&key), "local refusal dropped '{key}'");
+        }
+    }
+
+    /// The envelope goes into the same logs the others do, so it is redacted the
+    /// same way — even though nothing describing a profile ought to be a secret.
+    #[test]
+    fn a_local_refusal_redacts_its_target() {
+        let value = local_refusal(
+            &OperationRef::new("config delete"),
+            Classification::new(false, true, true),
+            &serde_json::json!({ "profile": "staging", "apiKey": "leaked" }),
+        );
+        assert_eq!(value["target"]["apiKey"], REDACTED);
+        assert_eq!(value["target"]["profile"], "staging");
     }
 
     #[test]

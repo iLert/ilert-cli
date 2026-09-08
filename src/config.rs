@@ -75,20 +75,13 @@ impl ResolvedConfig {
         }
     }
 
-    /// The environment a stored credential belongs to, normalized.
+    /// The environment this profile's stored credential belongs to.
     ///
-    /// Credentials written before endpoint binding existed carry nothing, so
-    /// they fall back to the profile's own endpoint and then to production —
-    /// which is where such a credential must have come from, since login has
-    /// always persisted the base URL it was given. The fallbacks deliberately
-    /// never consult [`Self::base_url`]: that is the value an override can
-    /// control, and trusting it would answer the question with the question.
+    /// See [`credential_endpoint`], which this delegates to — the fallbacks are
+    /// shared with callers that have to place a credential belonging to some
+    /// *other* profile, such as `config delete`.
     pub fn credential_endpoint(&self, cred: &Credential) -> String {
-        let source = cred
-            .base_url()
-            .or(self.profile_base_url.as_deref())
-            .unwrap_or(DEFAULT_BASE_URL);
-        normalize_base_url(source)
+        credential_endpoint(cred, self.profile_base_url.as_deref())
     }
 
     /// Refuse to hand a stored credential to an endpoint it was not issued for.
@@ -211,6 +204,23 @@ impl ResolvedConfig {
         crate::secret_store::store(&self.profile_name, &refreshed)?;
         Ok(refreshed.bearer_value().to_string())
     }
+}
+
+/// The environment a stored credential belongs to, normalized.
+///
+/// Credentials written before endpoint binding existed carry nothing, so they
+/// fall back to the profile's own endpoint and then to production — which is
+/// where such a credential must have come from, since login has always persisted
+/// the base URL it was given. The fallbacks deliberately never consult the
+/// endpoint the *current invocation* resolved to: that is the value `--base-url`
+/// and `ILERT_BASE_URL` can control, and trusting it would answer the question
+/// with the question.
+pub fn credential_endpoint(cred: &Credential, profile_base_url: Option<&str>) -> String {
+    let source = cred
+        .base_url()
+        .or(profile_base_url)
+        .unwrap_or(DEFAULT_BASE_URL);
+    normalize_base_url(source)
 }
 
 /// A canonical form of a base URL, for binding a credential to an environment
@@ -402,8 +412,47 @@ impl ConfigManager {
         self.save()
     }
 
+    /// The profile a run selects when neither `--profile` nor `ILERT_PROFILE`
+    /// says otherwise.
+    ///
+    /// A config file with no `default_profile` — a fresh install, or one whose
+    /// default was just deleted — resolves to `"default"`, which is the name
+    /// [`Self::resolve`] falls back to.
+    pub fn default_profile(&self) -> &str {
+        self.config.default_profile.as_deref().unwrap_or("default")
+    }
+
+    /// Every profile the config file holds settings for, sorted.
+    pub fn profile_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.config.profiles.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Drop a profile's settings, reporting whether it was also the default.
+    ///
+    /// A deleted default is cleared rather than reassigned to some surviving
+    /// profile: picking a replacement would be this command guessing which
+    /// environment the next command should talk to, and the wrong guess is a
+    /// request sent somewhere nobody named. Cleared, the fallback is the same
+    /// `"default"` a fresh install starts from.
+    ///
+    /// The caller is responsible for the credential — see
+    /// [`crate::secret_store::delete`]. Settings and secrets live in different
+    /// stores, and dropping the settings first is what leaves an orphaned
+    /// credential behind with nothing left to name it.
+    pub fn remove_profile(&mut self, name: &str) -> Result<bool> {
+        self.config.profiles.remove(name);
+        let was_default = self.config.default_profile.as_deref() == Some(name);
+        if was_default {
+            self.config.default_profile = None;
+        }
+        self.save()?;
+        Ok(was_default)
+    }
+
     pub fn list_profiles(&self) -> Vec<(&str, bool)> {
-        let default = self.config.default_profile.as_deref().unwrap_or("default");
+        let default = self.default_profile();
         self.config
             .profiles
             .keys()

@@ -565,14 +565,30 @@ impl Cli {
             }
             Some(("logout", _)) => {
                 // Best-effort revoke of an OAuth refresh token before deleting.
-                if let Ok(Some(cred)) = secret_store::retrieve(&config.profile_name)
+                // A credential that cannot be read is still deleted below — the
+                // store does not have to understand an entry to remove one — but
+                // the token inside it goes unrevoked, and that is worth saying.
+                // Read once: on macOS each keyring access can cost the operator
+                // a dialog.
+                let stored = match secret_store::retrieve(&config.profile_name) {
+                    Ok(stored) => stored,
+                    Err(_) => {
+                        ctx.warn(
+                            "the stored credential could not be read, so nothing was revoked — \
+                             an OAuth refresh token in it stays valid at the issuer until it \
+                             expires. Logging out anyway.",
+                        );
+                        None
+                    }
+                };
+                if let Some(ref cred) = stored
                     && let Some(rt) = cred.refresh_token()
                 {
                     // Revoke at the endpoint that issued the token, never at
                     // whatever `--base-url` this invocation happens to carry:
                     // revocation only means anything at the issuer, and sending
                     // the token anywhere else would disclose it on the way out.
-                    let issuer = config.credential_endpoint(&cred);
+                    let issuer = config.credential_endpoint(cred);
                     if issuer != crate::config::normalize_base_url(&config.base_url) {
                         ctx.warn(&format!(
                             "revoking at {issuer}, where this credential was issued — \
@@ -720,16 +736,198 @@ impl Cli {
                 });
                 ctx.print(&info)
             }
+            Some(("use", sub)) => {
+                let name = sub.get_one::<String>("name").expect("required");
+                self.handle_config_use(name, ctx)
+            }
+            Some(("delete", sub)) => {
+                let name = sub.get_one::<String>("name").expect("required");
+                self.handle_config_delete(name, ctx).await
+            }
             Some(("import", _)) => {
                 self.handle_config_import(config)?;
                 Ok(())
             }
             Some(("cache", sub)) => self.handle_config_cache(sub, config, ctx).await,
             _ => {
-                eprintln!("Usage: ilert config <list|show|import|cache>");
+                eprintln!("Usage: ilert config <list|show|use|delete|import|cache>");
                 Ok(())
             }
         }
+    }
+
+    /// Refuse to act on a profile the config file has never heard of.
+    ///
+    /// Neither `use` nor `delete` may bring a profile into existence — profiles
+    /// are created by logging in, which is also what gives them an endpoint and
+    /// a credential. Writing a mistyped name as the default would instead point
+    /// every later command at a profile with neither: it resolves to production
+    /// and reports "Not authenticated", nowhere near the typo that caused it.
+    fn require_known_profile(&self, name: &str) -> Result<&Profile> {
+        if let Some(profile) = self.config_manager.profile(name) {
+            return Ok(profile);
+        }
+        let known = self.config_manager.profile_names();
+        let known = if known.is_empty() {
+            "none are configured".to_string()
+        } else {
+            known.join(", ")
+        };
+        Err(CliError::user(format!(
+            "No profile named '{name}'. Known profiles: {known}.\n\
+             Profiles are created by logging in:\n  \
+             ilert --profile {name} auth login"
+        ))
+        .into())
+    }
+
+    /// `ilert config use <name>` — pick the profile every later command runs as.
+    ///
+    /// Only the selection moves. Credentials stay bound to the environment that
+    /// issued them, so switching to a profile does not lend it another one's
+    /// token; a profile without its own credential is unauthenticated, exactly
+    /// as it was before.
+    fn handle_config_use(&mut self, name: &str, ctx: &RunContext) -> Result<()> {
+        let profile = self.require_known_profile(name)?;
+        let base_url = profile.base_url.clone();
+
+        self.config_manager.set_default_profile(name)?;
+
+        ctx.info(&format!(
+            "{} Default profile is now '{name}'",
+            "OK".green().bold()
+        ));
+        // The profile's *own* endpoint, null when it never set one — not the
+        // one a command would resolve, which `ILERT_BASE_URL` and `--base-url`
+        // still have a say in. `ilert config show` answers that question.
+        ctx.print(&serde_json::json!({
+            "default_profile": name,
+            "base_url": base_url,
+        }))
+    }
+
+    /// `ilert config delete <name>` — remove a profile's settings and the
+    /// credential stored alongside them.
+    ///
+    /// Both halves, because the report this fixes was about the one that gets
+    /// forgotten: a profile removed by hand from `config.json` leaves its
+    /// keyring entry behind, and nothing names it any more.
+    ///
+    /// The credential goes first, then the settings. If the store refuses —
+    /// locked, or access denied — the settings stay put and the profile is still
+    /// whole, which is a better place to fail than one holding a secret with
+    /// nothing left to reach it by. A credential that cannot be *parsed* is not
+    /// such a refusal: it is read only to find a refresh token to revoke, and
+    /// removing it never needed to understand it.
+    async fn handle_config_delete(&mut self, name: &str, ctx: &RunContext) -> Result<()> {
+        let profile = self.require_known_profile(name)?;
+        let profile_base_url = profile.base_url.clone();
+
+        self.confirm_local(
+            ctx,
+            "config delete",
+            format!("Delete profile '{name}' and any credential stored for it"),
+            &serde_json::json!({
+                "profile": name,
+                "base_url": profile_base_url,
+            }),
+        )?;
+
+        // Read only to find a token worth revoking, so a credential that cannot
+        // be read costs a revocation and nothing else. Removing an entry never
+        // parses it — failing the whole delete here would strand a malformed
+        // secret in the store with no command able to reach it, which is the one
+        // state an operator has no way out of.
+        let stored = match secret_store::retrieve(name) {
+            Ok(stored) => stored,
+            Err(_) => {
+                ctx.warn(&format!(
+                    "the credential stored for '{name}' could not be read, so nothing was \
+                     revoked — an OAuth refresh token in it stays valid at the issuer until it \
+                     expires. Removing it anyway."
+                ));
+                None
+            }
+        };
+
+        // Deleting a refresh token from this machine does not stop it working
+        // at the issuer, so revoke it the way `auth logout` does — and at the
+        // endpoint that issued it, resolved from the profile being deleted
+        // rather than from whatever `--base-url` this invocation carries.
+        if let Some(ref cred) = stored
+            && let Some(rt) = cred.refresh_token()
+        {
+            let issuer = crate::config::credential_endpoint(cred, profile_base_url.as_deref());
+            oauth::revoke(&issuer, rt).await;
+        }
+
+        // The credential first, and the settings only once it is gone: a store
+        // that refuses — locked, or access denied — leaves the profile whole and
+        // still named, rather than leaving its secret behind with nothing to
+        // name it. That orphan is the report this command exists to answer.
+        let credential_removed = secret_store::delete(name)?;
+        let was_default = self.config_manager.remove_profile(name)?;
+
+        ctx.info(&format!("{} Deleted profile '{name}'", "OK".green().bold()));
+        if was_default {
+            ctx.info(&format!(
+                "{} '{name}' was the default; commands now run as '{}' unless --profile \
+                 (or ILERT_PROFILE) says otherwise",
+                "Note:".yellow().bold(),
+                self.config_manager.default_profile()
+            ));
+        }
+        ctx.print(&serde_json::json!({
+            "deleted_profile": name,
+            "credential_removed": credential_removed,
+            "default_profile": self.config_manager.default_profile(),
+        }))
+    }
+
+    /// Gate a destructive change to state on this machine.
+    ///
+    /// The policy is [`Self::confirm`]'s, for the same reason: a human at a
+    /// terminal is asked, and anything else has to have said `--yes` up front,
+    /// because a prompt nobody can answer is a hang and proceeding regardless is
+    /// worse. What differs is only that there is no request to describe, so the
+    /// refusal carries what would have changed locally instead.
+    fn confirm_local(
+        &self,
+        ctx: &RunContext,
+        command: &str,
+        description: String,
+        target: &serde_json::Value,
+    ) -> Result<()> {
+        // Read from the same table the request path reads, so a local command
+        // cannot be gated here and classified as harmless there. An unlisted one
+        // is treated as destructive: `every_static_command_is_classified` makes
+        // that unreachable, and the safe direction for the unreachable case is
+        // to ask.
+        let classification = crate::classification::for_static_command(command)
+            .unwrap_or_else(|| Classification::new(false, true, false));
+        if !classification.destructive || ctx.auto_confirm {
+            return Ok(());
+        }
+
+        if ctx.can_prompt() {
+            let confirmed = dialoguer::Confirm::new()
+                .with_prompt(format!("{description}. This cannot be undone. Continue?"))
+                .default(false)
+                .interact()?;
+            return if confirmed {
+                Ok(())
+            } else {
+                Err(CliError::Cancelled.into())
+            };
+        }
+
+        let op_ref = OperationRef::new(command.to_string()).with_description(Some(description));
+        Err(CliError::confirmation_required(preview::local_refusal(
+            &op_ref,
+            classification,
+            target,
+        ))
+        .into())
     }
 
     /// `ilert config cache clear|refresh`.
@@ -1886,6 +2084,18 @@ fn build_config_command() -> Command {
         .arg_required_else_help(true)
         .subcommand(Command::new("list").about("List all profiles"))
         .subcommand(Command::new("show").about("Show current configuration"))
+        .subcommand(
+            Command::new("use").about("Set the default profile").arg(
+                Arg::new("name")
+                    .required(true)
+                    .help("Profile to run as when --profile is not given"),
+            ),
+        )
+        .subcommand(
+            Command::new("delete")
+                .about("Delete a profile and its stored credential")
+                .arg(Arg::new("name").required(true).help("Profile to remove")),
+        )
         .subcommand(
             Command::new("import").about("Import config from ILERT_* environment variables"),
         )

@@ -75,6 +75,18 @@ ilert --profile <name> alerts list
 ilert --profile <name> ops list
 ```
 
+Logging in also makes that profile the default. To switch back later, or between
+two profiles that both already exist:
+
+```bash
+ilert config use <name>              # what every later command runs as
+```
+
+It only moves the selection. Credentials stay bound to the environment that
+issued them, so selecting a profile never lends it another one's token, and a
+name that is not already a profile is refused rather than created — profiles come
+from logging in.
+
 Headless, or an API-key environment:
 
 ```bash
@@ -113,6 +125,24 @@ ilert config list                    # every profile, and which is default
 think — check `base_url` before concluding anything is broken. `credential_endpoint`
 next to it is where the stored credential was issued; the two matching is what
 lets the command run.
+
+## Remove it
+
+```bash
+ilert config delete <name>           # settings and stored credential together
+```
+
+Both halves go in one step, which is the point: settings live in `config.json`
+and the credential lives in the keyring, and removing the profile by hand leaves
+the credential behind with nothing left naming it. An OAuth refresh token is
+revoked first, at the endpoint that issued it — deleting it from this machine
+does not stop it working at the server. Deleting the default leaves no dangling
+selection: it falls back to `default`.
+
+It asks first, and outside a terminal it refuses without `--yes`, because it is
+the one command that destroys state belonging to a profile other than the one it
+runs as. To drop only the credential and keep the profile, use `ilert --profile
+<name> auth logout`.
 
 ## When it does not work
 

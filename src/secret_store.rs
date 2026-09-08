@@ -165,7 +165,10 @@ pub fn store(account: &str, cred: &Credential) -> Result<()> {
         #[cfg(debug_assertions)]
         Backend::File(path) => {
             let mut map = read_file_map(&path)?;
-            map.insert(account.to_string(), cred.clone());
+            map.insert(
+                account.to_string(),
+                serde_json::from_str(&json).context("Failed to serialize credential")?,
+            );
             write_file_map(&path, &map)?;
         }
     }
@@ -193,19 +196,33 @@ pub fn retrieve(account: &str) -> Result<Option<Credential>> {
         #[cfg(debug_assertions)]
         Backend::File(path) => {
             let map = read_file_map(&path)?;
-            Ok(map.get(account).cloned())
+            match map.get(account) {
+                Some(value) => Ok(Some(
+                    serde_json::from_value(value.clone())
+                        .context("Failed to parse stored credential")?,
+                )),
+                None => Ok(None),
+            }
         }
     }
 }
 
-/// Delete the credential for `account`. Succeeds even if none is stored.
-pub fn delete(account: &str) -> Result<()> {
+/// Delete the credential for `account`, reporting whether there was one.
+///
+/// Succeeds when none is stored, and — deliberately — when the one that is
+/// stored cannot be understood. Removing an entry never parses its contents, so
+/// a credential this build cannot read is still one it can get rid of; anything
+/// else would leave a malformed secret in the store with no command able to
+/// remove it. Callers that want to *revoke* before deleting read it separately
+/// and treat a read failure as "nothing to revoke".
+pub fn delete(account: &str) -> Result<bool> {
     match backend() {
         Backend::Keyring => {
             let entry =
                 keyring::Entry::new(SERVICE, account).context("Failed to open keyring entry")?;
             match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Ok(()) => Ok(true),
+                Err(keyring::Error::NoEntry) => Ok(false),
                 Err(e) => {
                     Err(anyhow::Error::new(e).context("Failed to delete credential from keyring"))
                 }
@@ -214,16 +231,24 @@ pub fn delete(account: &str) -> Result<()> {
         #[cfg(debug_assertions)]
         Backend::File(path) => {
             let mut map = read_file_map(&path)?;
-            if map.remove(account).is_some() {
-                write_file_map(&path, &map)?;
+            if map.remove(account).is_none() {
+                return Ok(false);
             }
-            Ok(())
+            write_file_map(&path, &map)?;
+            Ok(true)
         }
     }
 }
 
+/// The file seam's map, keyed by account exactly as the keyring is.
+///
+/// Values stay unparsed [`serde_json::Value`]s so that one unreadable
+/// credential is one unreadable credential: the keyring stores an entry per
+/// account and cannot be poisoned by a neighbour, and a seam that parsed the
+/// whole file would fail where the real backend succeeds — hiding, in tests, the
+/// exact case this shape exists to keep honest.
 #[cfg(debug_assertions)]
-fn read_file_map(path: &PathBuf) -> Result<HashMap<String, Credential>> {
+fn read_file_map(path: &PathBuf) -> Result<HashMap<String, serde_json::Value>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -235,7 +260,7 @@ fn read_file_map(path: &PathBuf) -> Result<HashMap<String, Credential>> {
 }
 
 #[cfg(debug_assertions)]
-fn write_file_map(path: &PathBuf, map: &HashMap<String, Credential>) -> Result<()> {
+fn write_file_map(path: &PathBuf, map: &HashMap<String, serde_json::Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create secret file directory")?;
     }

@@ -343,6 +343,10 @@ pub const STATIC_COMMANDS: &[(&str, Classification)] = &[
     // it needs to ask about is running the installer, not an API call.
     ("update", Classification::new(false, false, true)),
     ("config import", Classification::new(false, false, true)),
+    // Selecting a default profile moves nothing and destroys nothing; it only
+    // decides which profile the *next* command runs as, and running it again
+    // with the same name lands in the same place.
+    ("config use", Classification::new(false, false, true)),
     // Deleting a cache is a local mutation, not a destructive one: nothing on
     // the server changes, and every file dropped is one the CLI refetches by
     // itself on the next run that needs it. Repeating either is the same as
@@ -355,6 +359,16 @@ pub const STATIC_COMMANDS: &[(&str, Classification)] = &[
         "config cache refresh",
         Classification::new(false, false, true),
     ),
+    // The exception among the local mutations, and the reason the line above is
+    // drawn where it is. A cache refetches itself and a logout is one half of a
+    // flow whose other half is a login — both act on the context the invocation
+    // is already running in. `config delete` names *another* profile as a string
+    // and removes its settings and its stored credential together, so a typo
+    // destroys state the operator was not thinking about and nothing in the
+    // command reveals which one until it is gone. Idempotent all the same:
+    // repeating it changes nothing further, it only reports that there is
+    // nothing left to remove.
+    ("config delete", Classification::new(false, true, true)),
     // Remote mutations.
     ("event send", Classification::new(false, false, false)),
     ("heartbeat ping", Classification::new(false, false, true)),
