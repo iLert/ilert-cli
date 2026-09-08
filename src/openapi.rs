@@ -100,6 +100,21 @@ pub struct Parameter {
     pub schema: Option<Value>,
 }
 
+impl Parameter {
+    /// Whether the spec declares this parameter as a list of values.
+    ///
+    /// Every array parameter in the ilert spec is `style: form, explode: true`,
+    /// which is also OpenAPI's default for query parameters, so a list travels
+    /// as one `name=value` pair per element rather than one comma-joined pair.
+    pub fn is_list(&self) -> bool {
+        self.schema
+            .as_ref()
+            .and_then(|schema| schema.get("type"))
+            .and_then(|ty| ty.as_str())
+            == Some("array")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamLocation {
     Path,
@@ -871,6 +886,15 @@ mod tests {
             )]);
             assert_eq!(uncapped.max_results_cap(), None);
             assert_eq!(operation(vec![]).max_results_cap(), None);
+        }
+
+        #[test]
+        fn a_list_parameter_is_the_one_the_schema_calls_an_array() {
+            assert!(query_param("include", Some(serde_json::json!({"type": "array"}))).is_list());
+            assert!(!query_param("q", Some(serde_json::json!({"type": "string"}))).is_list());
+            // A parameter the spec left untyped is a single value, not a list:
+            // repeating it would be a guess about a shape nobody declared.
+            assert!(!query_param("q", None).is_list());
         }
     }
 }

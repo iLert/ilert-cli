@@ -1657,6 +1657,15 @@ fn build_operation_command(op: &Operation) -> Command {
         if let Some(ref desc) = param.description {
             arg = arg.help(help_text(desc));
         }
+        // A parameter the spec declares as an array is offered as a repeatable
+        // flag, because that is what its own help text promises: "You may
+        // declare multiple". Without this, `--include a --include b` was a
+        // usage error, and one only visible on stderr — it was reported as an
+        // empty result, which is what a rejected read looks like to anything
+        // that reads stdout alone.
+        if param.is_list() {
+            arg = arg.action(ArgAction::Append);
+        }
         match param.location {
             ParamLocation::Path if takes_stdin && stdin_substitutes(&param.name) => {
                 arg = arg.required_unless_present("stdin").conflicts_with("stdin");
@@ -2034,5 +2043,120 @@ mod tests {
         assert!(wants_update_check(&parse(&["ilert", "config", "show"])));
         assert!(wants_update_check(&parse(&["ilert", "version"])));
         assert!(wants_update_check(&parse(&["ilert", "status"])));
+    }
+
+    // -----------------------------------------------------------------------
+    // List parameters
+    // -----------------------------------------------------------------------
+
+    /// `schedules get`, cut down to the two parameters the spec gives it.
+    fn schedules_get() -> crate::openapi::Operation {
+        use crate::classification::Classification;
+        use crate::openapi::{ParamLocation, Parameter};
+
+        crate::openapi::Operation {
+            id: "get-schedules-id".into(),
+            method: "GET".into(),
+            path: "/schedules/{id}".into(),
+            summary: None,
+            description: None,
+            tag: "schedules".into(),
+            action: "get".into(),
+            parameters: vec![
+                Parameter {
+                    name: "id".into(),
+                    location: ParamLocation::Path,
+                    required: true,
+                    description: None,
+                    schema: Some(serde_json::json!({"type": "number"})),
+                },
+                Parameter {
+                    name: "include".into(),
+                    location: ParamLocation::Query,
+                    required: false,
+                    description: Some(
+                        "Describes optional properties that should be included in the \
+                         response. You may declare multiple."
+                            .into(),
+                    ),
+                    schema: Some(serde_json::json!({"type": "array", "items": {"type": "string"}})),
+                },
+            ],
+            request_body_schema: None,
+            has_request_body: false,
+            request_body_required: false,
+            classification: Classification::new(true, false, true),
+        }
+    }
+
+    fn query_for(argv: &[&str]) -> Result<Vec<(String, String)>, clap::Error> {
+        let op = schedules_get();
+        let matches = build_operation_command(&op).try_get_matches_from(argv)?;
+        let params = crate::runner::build_params(
+            &op,
+            &matches,
+            &crate::runner::BuildOptions {
+                base_url: "https://api.ilert.com",
+                allow_prompting: false,
+                templated_path: false,
+            },
+        )
+        .expect("the request builds");
+        assert_eq!(params.path, "/schedules/1");
+        Ok(params.query)
+    }
+
+    /// The reported bug: repeating `--include` was a usage error, reported from
+    /// a migration script as an empty result — indistinguishable there from
+    /// "the schedule has no layers". The flag's help text is the spec's own:
+    /// "You may declare multiple".
+    #[test]
+    fn a_list_parameter_may_be_given_more_than_once() {
+        let query = query_for(&[
+            "get",
+            "--id",
+            "1",
+            "--include",
+            "scheduleLayers",
+            "--include",
+            "currentShift",
+        ])
+        .expect("repeated --include parses");
+
+        // `style: form, explode: true` — one pair per value. Comma-joining them
+        // into a single pair would be a different serialization than the one the
+        // spec declares.
+        assert_eq!(
+            query,
+            vec![
+                ("include".to_string(), "scheduleLayers".to_string()),
+                ("include".to_string(), "currentShift".to_string()),
+            ]
+        );
+    }
+
+    /// The form that already worked keeps working: the value is passed through
+    /// as given rather than split, so nothing that relied on it changes.
+    #[test]
+    fn a_comma_joined_list_is_still_sent_as_one_value() {
+        let query = query_for(&["get", "--id", "1", "--include", "a,b"]).expect("parses");
+        assert_eq!(query, vec![("include".to_string(), "a,b".to_string())]);
+    }
+
+    #[test]
+    fn a_list_parameter_is_optional_when_the_spec_says_so() {
+        assert_eq!(query_for(&["get", "--id", "1"]).expect("parses"), vec![]);
+    }
+
+    /// Repeatability is granted by the schema, not by being a query parameter.
+    /// `--id` is a single value, and giving it twice stays the error it was.
+    #[test]
+    fn a_single_valued_parameter_is_still_refused_twice() {
+        let err =
+            query_for(&["get", "--id", "1", "--id", "2"]).expect_err("--id must not be repeatable");
+        assert!(
+            err.to_string().contains("cannot be used multiple times"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -326,18 +326,8 @@ impl RequestParams {
         let overrides = param_overrides(args, operation)?;
 
         for param in &operation.parameters {
-            let owned = args
-                .try_get_one::<String>(&param.name)
-                .ok()
-                .flatten()
-                .cloned()
-                .or_else(|| {
-                    overrides
-                        .iter()
-                        .find(|(k, _)| *k == param.name)
-                        .map(|(_, v)| v.clone())
-                });
-            let value = owned.as_deref();
+            let values = param_values(args, &overrides, param);
+            let value = values.first().map(String::as_str);
 
             match &param.location {
                 ParamLocation::Path => match value {
@@ -356,25 +346,28 @@ impl RequestParams {
                         .into());
                     }
                 },
-                ParamLocation::Query => match value {
-                    Some(val) => query.push((param.name.clone(), val.to_string())),
-                    None if param.required => {
+                ParamLocation::Query => {
+                    if values.is_empty() && param.required {
                         return Err(missing_parameter(operation, param, "query").into());
                     }
-                    None => {}
-                },
-                ParamLocation::Header => match value {
-                    Some(val) => {
+                    // One pair per value, which is how the spec says a list
+                    // parameter is serialized (`style: form, explode: true`) and
+                    // how `ilert status` has always sent its `states`.
+                    for val in &values {
+                        query.push((param.name.clone(), val.clone()));
+                    }
+                }
+                ParamLocation::Header => {
+                    if values.is_empty() && param.required {
+                        return Err(missing_parameter(operation, param, "header").into());
+                    }
+                    for val in &values {
                         // A spec-declared header parameter is still caller input,
                         // so it goes through the same gate as `-H`.
                         crate::http::ensure_not_reserved(&param.name)?;
-                        headers.push((param.name.clone(), val.to_string()));
+                        headers.push((param.name.clone(), val.clone()));
                     }
-                    None if param.required => {
-                        return Err(missing_parameter(operation, param, "header").into());
-                    }
-                    None => {}
-                },
+                }
             }
         }
 
@@ -423,6 +416,50 @@ fn missing_parameter(operation: &Operation, param: &Parameter, location: &str) -
         "{} {} requires the {} parameter '{}'{}.",
         operation.tag, operation.action, location, param.name, hint
     ))
+}
+
+/// Everything the caller supplied for one parameter, in the order given.
+///
+/// A list parameter may be repeated, so it can carry more than one value;
+/// anything else carries at most one. The two are read through different clap
+/// accessors on purpose — asking for a single value where the flag was declared
+/// repeatable is a definition/access mismatch, which clap treats as a bug in the
+/// caller rather than as an error to report.
+fn param_values(
+    args: &clap::ArgMatches,
+    overrides: &[(String, String)],
+    param: &crate::openapi::Parameter,
+) -> Vec<String> {
+    let from_args: Vec<String> = if param.is_list() {
+        args.try_get_many::<String>(&param.name)
+            .ok()
+            .flatten()
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default()
+    } else {
+        args.try_get_one::<String>(&param.name)
+            .ok()
+            .flatten()
+            .cloned()
+            .into_iter()
+            .collect()
+    };
+
+    if !from_args.is_empty() {
+        return from_args;
+    }
+
+    // `--param name=value` covers operations dispatched by ID, whose parameters
+    // clap never saw.
+    let mut from_overrides: Vec<String> = overrides
+        .iter()
+        .filter(|(key, _)| *key == param.name)
+        .map(|(_, value)| value.clone())
+        .collect();
+    if !param.is_list() {
+        from_overrides.truncate(1);
+    }
+    from_overrides
 }
 
 /// `--param name=value`, the escape hatch for operations dispatched by ID.

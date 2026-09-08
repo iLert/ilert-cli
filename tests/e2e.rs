@@ -375,6 +375,54 @@ async fn list_alerts_passes_query_params() {
         .stdout(predicate::str::contains("Filtered alert"));
 }
 
+/// Regression: repeating a list flag was a clap usage error, even though the
+/// flag's own help text — the spec's words — says "You may declare multiple".
+/// It was reported as empty output and exit 0 during a bulk migration, which
+/// read as "this schedule has no layers" rather than as a rejected argument.
+/// The CLI itself exits 2 and writes the rejection to stderr, so something
+/// between the two swallowed it; whatever that was, a usage error the caller
+/// has to notice on stderr is a poor answer to a flag the help says is
+/// repeatable.
+#[tokio::test]
+async fn a_repeated_list_flag_sends_one_query_pair_per_value() {
+    let h = TestHarness::start().await;
+    h.seed_cache().await;
+
+    // Two separate `include=` pairs, which is what `style: form, explode: true`
+    // means. A single comma-joined pair would match neither matcher, and the
+    // unmatched request would come back a 404.
+    Mock::given(method("GET"))
+        .and(path("/api/schedules/1"))
+        .and(query_param("include", "scheduleLayers"))
+        .and(query_param("include", "currentShift"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "name": "Primary",
+            "scheduleLayers": [{"name": "Layer 1"}],
+        })))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args([
+            "schedules",
+            "get",
+            "--api-key",
+            "test-key",
+            "--id",
+            "1",
+            "--include",
+            "scheduleLayers",
+            "--include",
+            "currentShift",
+            "-o",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Layer 1"));
+}
+
 // ---------------------------------------------------------------------------
 // Get single resource
 // ---------------------------------------------------------------------------
