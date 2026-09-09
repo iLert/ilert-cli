@@ -154,9 +154,15 @@ OpenAPI `deprecated` flag. Treat enums as open, and ignore unknown JSON properti
 ISO-8601 parser, never a fixed pattern. Input is lenient and accepts offsets, but
 nothing echoes your offset back.
 
-**If it is not in `openapi.json`, do not build on it.** The spec is the supported
-public surface; anything else you may find reachable is internal or in alpha, and
-may change without notice.
+**If it is not in one of the two published specs, do not build on it.** The
+supported public surface is `openapi.json` plus the companion beta document
+(`/api/beta/openapi.json`), which the CLI merges into the same command tree.
+Anything else you may find reachable is internal, and may change without notice.
+
+**Beta endpoints are early access.** They are ordinary commands — `ilert ops
+list` marks them `"beta": true` — but their contracts may change or be withdrawn
+without notice and are not covered by the stability guarantees of the rest of the
+API. The opt-in header each one requires is filled in for you.
 
 ## Driving the CLI
 
@@ -271,7 +277,9 @@ to work around.
   `%2F` becomes a literal and 404s rather than re-targeting the request.
 * **The spec is cached for 24 hours**, so the command tree can lag a fresh API
   change. `ilert ops list` shows raw operations and `ilert api /any/path` bypasses
-  the generated tree.
+  the generated tree. `ILERT_NO_BETA_SPEC=1` keeps the beta document out of
+  the tree from the next spec fetch onwards (`ilert config cache refresh` to
+  apply it now).
 * **`ILERT_API_KEY` beats the keyring** and is never persisted. `--api-key` beats
   both. `ILERT_TEAM_CONTEXT` (or `--team-context`) adds an `x-team-context` header
   that scopes what you see — `0` all teams, `-1` my teams, or a team id. An easy

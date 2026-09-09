@@ -1099,6 +1099,7 @@ impl Cli {
                             "id": op.id, "tag": op.tag, "action": op.action,
                             "method": op.method, "path": op.path, "summary": op.summary,
                             "classification": op.classification.to_json(),
+                            "beta": op.beta,
                         }));
                     }
                 }
@@ -1121,7 +1122,7 @@ impl Cli {
                 })?;
                 let info = serde_json::json!({
                     "id": op.id, "method": op.method, "path": op.path,
-                    "tag": op.tag, "action": op.action,
+                    "tag": op.tag, "action": op.action, "beta": op.beta,
                     "summary": op.summary, "description": op.description,
                     "classification": op.classification.to_json(),
                     "parameters": op.parameters.iter().map(|p| serde_json::json!({
@@ -1869,8 +1870,13 @@ fn build_operation_command(op: &Operation) -> Command {
                 arg = arg.required_unless_present("stdin").conflicts_with("stdin");
             }
             ParamLocation::Path => arg = arg.required(true),
-            ParamLocation::Query => arg = arg.required(param.required),
-            ParamLocation::Header => arg = arg.required(param.required),
+            // A required parameter the spec gives a default is one the CLI can
+            // fill in, so it is not something to demand from the caller — see
+            // `Parameter::default_value`. It is still offered as a flag for
+            // anyone who needs to send something else.
+            ParamLocation::Query | ParamLocation::Header => {
+                arg = arg.required(param.required && param.default_value().is_none());
+            }
         }
         cmd = cmd.arg(arg);
     }
@@ -2296,6 +2302,7 @@ mod tests {
             has_request_body: false,
             request_body_required: false,
             classification: Classification::new(true, false, true),
+            beta: false,
         }
     }
 

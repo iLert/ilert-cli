@@ -1,0 +1,142 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Beta companion fixture",
+    "description": "A stand-in for the beta document ilert serves alongside the stable spec: separately versioned, prefixed paths, an opt-in header declared once and referenced by every operation, and a schema whose name the stable document also uses for something else.",
+    "version": "b1.2026.9-r.1"
+  },
+  "servers": [
+    {
+      "url": "/api"
+    }
+  ],
+  "security": [
+    {
+      "apiKey": []
+    }
+  ],
+  "paths": {
+    "/beta/incidents": {
+      "get": {
+        "tags": [
+          "Incidents"
+        ],
+        "summary": "List incidents (beta)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "description": "filter by a search term",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Incidents"
+        ],
+        "summary": "Create an incident (beta)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          }
+        ],
+        "requestBody": {
+          "description": "the incident",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IncidentNoIncludes"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/beta/search/incidents": {
+      "get": {
+        "tags": [
+          "Incidents"
+        ],
+        "summary": "Search incidents (beta)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/beta/widgets/{id}": {
+      "get": {
+        "tags": [
+          "Widgets"
+        ],
+        "summary": "Get a widget",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "number"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "apiKey",
+        "description": "The Bearer API key of your user.",
+        "name": "Authorization",
+        "in": "header"
+      }
+    },
+    "parameters": {
+      "IlertBetaHeader": {
+        "name": "ilert-beta",
+        "in": "header",
+        "required": true,
+        "description": "Opt-in header required by every beta operation. The value is not interpreted; `v1` is conventional.",
+        "schema": {
+          "type": "string",
+          "default": "v1"
+        }
+      }
+    },
+    "schemas": {
+      "IncidentNoIncludes": {
+        "type": "object",
+        "required": [
+          "betaOnlyField"
+        ],
+        "properties": {
+          "betaOnlyField": {
+            "type": "string",
+            "description": "A property the stable document's schema of the same name does not have."
+          }
+        }
+      }
+    }
+  }
+}

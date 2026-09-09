@@ -3690,3 +3690,340 @@ async fn update_is_offered_alongside_the_other_static_commands() {
         .success()
         .stdout(predicate::str::contains("update"));
 }
+
+// ---------------------------------------------------------------------------
+// The beta document
+// ---------------------------------------------------------------------------
+
+/// The goal of merging the two specs is that nothing downstream can tell there
+/// were two: a beta endpoint is a command, with the same shape of flags and the
+/// same output as any other. The opt-in header every beta operation requires is
+/// filled in from the spec rather than demanded, because a flag the caller has
+/// to repeat on every beta command is exactly the difference the merge exists
+/// to remove.
+#[tokio::test]
+async fn a_beta_endpoint_is_an_ordinary_command() {
+    let h = TestHarness::start_with_beta().await;
+    h.seed_cache().await;
+
+    h.cmd()
+        .args(["incidents", "list-incidents", "--dry-run", "-o", "raw"])
+        .assert()
+        .success()
+        // The beta document's own prefix, not the stable one's.
+        .stdout(predicate::str::contains("/api/beta/incidents"))
+        .stdout(predicate::str::contains("ilert-beta"))
+        .stdout(predicate::str::contains("v1"));
+
+    // A tag only the beta document describes becomes a command tree of its own.
+    h.cmd()
+        .args(["widgets", "get", "--id", "7", "--dry-run", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/beta/widgets/7"));
+
+    // And it really goes out, header and all.
+    Mock::given(method("GET"))
+        .and(path("/api/beta/incidents"))
+        .and(header("ilert-beta", "v1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(h.server())
+        .await;
+    h.seed_secret("default", json!({"type": "api_key", "key": "test-key"}));
+
+    h.cmd()
+        .args(["incidents", "list-incidents", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\""));
+}
+
+/// Two commands of one name is not a cosmetic problem: `clap` refuses to build
+/// a command whose subcommands collide, so a colliding name took out `--help`
+/// and every command under that tag with a panic. One suffix is not always
+/// enough to separate two operations — here two beta collections in the same
+/// tag both want `list-incidents`, and the stable spec has the same shape on
+/// its own — so the check has to be on the name an operation ends up with.
+#[tokio::test]
+async fn no_two_commands_in_a_tag_share_a_name() {
+    let h = TestHarness::start_with_beta().await;
+    h.seed_cache().await;
+
+    h.cmd()
+        .args(["incidents", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list-incidents"))
+        .stdout(predicate::str::contains("list-search-incidents"));
+
+    // Each of them is its own endpoint, not two names for one.
+    h.cmd()
+        .args([
+            "incidents",
+            "list-search-incidents",
+            "--query",
+            "db",
+            "--dry-run",
+            "-o",
+            "raw",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/beta/search/incidents"));
+}
+
+/// A beta document is additive, and additive has to mean it. `paths` is walked
+/// in sorted key order, so `/beta/incidents` is reached before `/incidents` —
+/// and without ordering the collision pass stable-first, a spec that added
+/// nothing but new endpoints would rename `incidents list` out from under
+/// everyone using it.
+#[tokio::test]
+async fn a_beta_endpoint_never_renames_a_stable_command() {
+    let h = TestHarness::start_with_beta().await;
+    h.seed_cache().await;
+
+    h.cmd()
+        .args(["incidents", "list", "--dry-run", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/incidents"))
+        .stdout(predicate::str::contains("/api/beta/incidents").not());
+}
+
+/// Both documents define `IncidentNoIncludes`, and they describe different
+/// things. Refs are resolved against the whole merged document, so if the beta
+/// definition were allowed to keep its name it would not fail — it would
+/// quietly re-describe the *stable* command's request body, in its `--set`
+/// help and in every dry run.
+#[tokio::test]
+async fn a_beta_schema_does_not_rewrite_the_stable_one_of_the_same_name() {
+    let h = TestHarness::start_with_beta().await;
+    h.seed_cache().await;
+
+    h.cmd()
+        .args(["ops", "show", "post-beta-incidents", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("betaOnlyField"));
+
+    h.cmd()
+        .args(["ops", "show", "post-incidents", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("betaOnlyField").not())
+        .stdout(predicate::str::contains("affectedServices"));
+}
+
+/// Not every ilert serves a beta document — a self-hosted or older install
+/// simply does not have one, and answers 404. That is an environment with no
+/// beta endpoints, not a failure, and it must cost the caller nothing: no
+/// warning, no non-zero exit, no missing commands.
+#[tokio::test]
+async fn a_deployment_without_a_beta_spec_is_not_an_error() {
+    let h = TestHarness::start().await;
+
+    h.cmd()
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    assert_eq!(
+        h.beta_spec_request_count().await,
+        1,
+        "the beta document is asked for; a 404 is the answer, not a reason not to ask"
+    );
+
+    // The stable command tree is all there.
+    h.cmd()
+        .args(["alerts", "list", "--dry-run", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/alerts"));
+}
+
+/// A beta document that is there and broken is a different case from one that
+/// is absent: something is wrong and saying so is worth a line on stderr. What
+/// it must not do is take the stable CLI down with it.
+#[tokio::test]
+async fn a_failing_beta_spec_degrades_to_the_stable_one() {
+    let h = TestHarness::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/beta/openapi.json"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(h.server())
+        .await;
+
+    // The failure is reported where it happens — on the fetch — and the
+    // stable document is indexed anyway.
+    h.cmd()
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("beta API spec"))
+        .stdout(predicate::str::contains("get-alerts"));
+
+    h.cmd()
+        .args(["alerts", "list", "--dry-run", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/alerts"));
+}
+
+/// The escape hatch, for a beta endpoint that breaks the command tree: the
+/// document is not fetched at all, and the CLI is the one it was before beta
+/// existed.
+#[tokio::test]
+async fn the_beta_document_can_be_switched_off() {
+    let h = TestHarness::start_with_beta().await;
+
+    h.cmd()
+        .env("ILERT_NO_BETA_SPEC", "1")
+        .args(["ops", "list", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/beta").not())
+        .stdout(predicate::str::contains("\"beta\": true").not());
+
+    assert_eq!(
+        h.beta_spec_request_count().await,
+        0,
+        "the beta document was fetched despite the opt-out"
+    );
+}
+
+/// A path parameter says *which resource* a request acts on, so a default in
+/// the spec is not a convenience — it is the document answering a question that
+/// belongs to the caller. Under `--stdin` it is worse than a single mistargeted
+/// request: the path is left templated so each line can substitute its own id,
+/// and a default fills the template in before the batch starts, pointing every
+/// line at one resource. Consent was given once, for a batch that then did not
+/// happen.
+#[tokio::test]
+async fn a_path_default_cannot_retarget_a_batch() {
+    let h = TestHarness::start_with_spec(helpers::CLASSIFICATION_SPEC).await;
+    h.seed_cache().await;
+
+    // The ids the caller piped in, each deleted exactly once...
+    for id in ["1", "2"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/vaults/{id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(h.server())
+            .await;
+    }
+    // ...and nothing at all sent to the one the spec asked for.
+    Mock::given(method("DELETE"))
+        .and(path("/api/vaults/999"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .env("ILERT_CLI_MODE", "agent")
+        .write_stdin("1\n2\n")
+        .args([
+            "vaults",
+            "delete",
+            "--stdin",
+            "--yes",
+            "--api-key",
+            "test-key",
+        ])
+        .assert()
+        .success();
+}
+
+/// The same rule with nothing piped in. `ops run` is the path that proves it:
+/// its parameters were never registered as clap args, so nothing before the
+/// runner demands the id — a path parameter the caller did not supply has to be
+/// a usage error there, not a value the spec gets to choose.
+#[tokio::test]
+async fn a_path_default_is_not_a_substitute_for_naming_the_resource() {
+    let h = TestHarness::start_with_spec(helpers::CLASSIFICATION_SPEC).await;
+    h.seed_cache().await;
+
+    h.cmd()
+        .env("ILERT_CLI_MODE", "agent")
+        .args(["ops", "run", "destroyVault", "--dry-run", "-o", "raw"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("/api/vaults/999").not());
+
+    // Named explicitly, it goes where the caller said.
+    h.cmd()
+        .env("ILERT_CLI_MODE", "agent")
+        .args([
+            "ops",
+            "run",
+            "destroyVault",
+            "--param",
+            "id=1",
+            "--dry-run",
+            "-o",
+            "raw",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/vaults/1"));
+}
+
+/// `by_id` is dispatch: `ops run <id>` sends what it finds there, and
+/// `OPERATION_OVERRIDES` decides what needs a `--yes` by the same key. A beta
+/// operation that declared a stable `operationId` used to replace that entry
+/// outright — `ops run get-alerts` would send a different request to a
+/// different endpoint, classified by whichever document took the name.
+#[tokio::test]
+async fn a_beta_operation_cannot_take_a_stable_operation_id() {
+    let mut beta: serde_json::Value =
+        serde_json::from_str(helpers::BETA_SPEC).expect("fixture is valid JSON");
+    beta["paths"]["/beta/impostor"] = json!({
+        "post": {
+            // The id the stable spec's `GET /alerts` is known by, and the id of
+            // a read-only override — the two shapes that buy something.
+            "operationId": "get-alerts",
+            "tags": ["Alerts"],
+            "summary": "An operation claiming an id that is not its own"
+        },
+        "put": {
+            "operationId": "post-users-search-email",
+            "tags": ["Alerts"],
+            "summary": "An operation claiming an overridden id"
+        }
+    });
+
+    let h = TestHarness::start_with_specs(
+        include_str!("fixtures/openapi.json"),
+        Some(&beta.to_string()),
+    )
+    .await;
+    h.seed_cache().await;
+
+    // The stable operation is still the one that id names.
+    h.cmd()
+        .args(["ops", "run", "get-alerts", "--dry-run", "-o", "raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"method\": \"GET\""))
+        .stdout(predicate::str::contains("/api/alerts"))
+        .stdout(predicate::str::contains("/api/beta/impostor").not());
+
+    // The impostor is still reachable — under a namespaced id, and without the
+    // classification it was reaching for: the override marks that id read-only,
+    // and a write must not be able to inherit that.
+    h.cmd()
+        .args([
+            "ops",
+            "run",
+            "beta.post-users-search-email",
+            "--dry-run",
+            "-o",
+            "raw",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/api/beta/impostor"))
+        .stdout(predicate::str::contains("\"read_only\": false"));
+}

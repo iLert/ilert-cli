@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -30,6 +30,55 @@ const MAX_SPEC_BYTES: usize = 32 * 1024 * 1024;
 /// opportunistically on the next write so an upgrade does not strand it.
 const LEGACY_CACHE_FILE: &str = "openapi.json";
 
+/// Where each OpenAPI document lives, relative to the API base URL.
+///
+/// ilert publishes two: the stable API, and a companion document describing the
+/// beta endpoints, released and versioned separately. They are merged into one
+/// before anything downstream sees them, so a beta endpoint arrives as an
+/// ordinary command rather than as a mode the caller has to know about.
+const STABLE_SPEC_PATH: &str = "/api-docs/openapi.json";
+const BETA_SPEC_PATH: &str = "/api/beta/openapi.json";
+
+/// Set to a non-empty value to leave the beta document out entirely — the
+/// escape hatch for a beta endpoint that breaks the command tree. It gates the
+/// fetch, so it takes effect on the next one: `ilert config cache refresh`
+/// applies it immediately, and otherwise the cached merged spec stands until
+/// its TTL.
+const NO_BETA_ENV: &str = "ILERT_NO_BETA_SPEC";
+
+/// Stamped onto every operation the beta document contributed, so the merge is
+/// still legible in the cached document — which is the only place the two
+/// specs can still be told apart once they are one.
+const SPEC_ORIGIN_KEY: &str = "x-ilert-cli-spec";
+const BETA_ORIGIN: &str = "beta";
+
+/// Stamped onto every operation with the server base path its own document
+/// declared.
+///
+/// Two specs can state two different prefixes, and one `servers` array cannot
+/// hold both. Recording it per operation keeps the `paths` keys exactly as each
+/// document authored them — which matters because [`operation_id`] synthesizes
+/// ids from those keys, and every `OPERATION_OVERRIDES` entry, every
+/// `ilert ops run <id>` and every classification test is written against the
+/// ids the unprefixed keys produce.
+const SPEC_BASE_PATH_KEY: &str = "x-ilert-cli-base-path";
+
+/// Where the merged document records the version of each document it was built
+/// from. `info.version` stays the stable one, since that is the version the API
+/// is known by.
+const SPEC_VERSIONS_KEY: &str = "x-ilert-cli-spec-versions";
+
+/// The prefix a beta name is moved under when it would otherwise take one that
+/// belongs to the stable half of the document.
+///
+/// Two of those namespaces exist, for the same reason. Both documents define a
+/// `Postmortem` schema and they are not the same shape, so without a namespace
+/// whichever landed last would silently rewrite the `--set` help and the
+/// dry-run preview of the *other* document's commands. And `by_id` is what
+/// `ops run <id>` dispatches on, so a beta operation declaring an
+/// `operationId` the stable spec already uses would replace it outright.
+const BETA_NAMESPACE: &str = "beta.";
+
 #[derive(Debug, Clone)]
 pub struct Operation {
     pub id: String,
@@ -49,6 +98,10 @@ pub struct Operation {
     /// How dangerous this operation is. Resolved once, here, so the
     /// confirmation flow never has to guess from a method string.
     pub classification: Classification,
+    /// Whether this operation came from the beta document. It behaves like any
+    /// other — the flag exists so `ops list` and `ops show` can say so, and so
+    /// the name a collision resolves to is decided stable-first.
+    pub beta: bool,
 }
 
 /// The query parameters that drive offset pagination. Both have to be present:
@@ -113,6 +166,26 @@ impl Parameter {
             .and_then(|ty| ty.as_str())
             == Some("array")
     }
+
+    /// The value to send when the caller supplies none.
+    ///
+    /// Only consulted for a *required* parameter. An optional one is left out
+    /// of the request entirely, which is what the server's own default is for —
+    /// sending it explicitly would state a choice the caller never made.
+    ///
+    /// A required parameter with a fixed default is the shape the beta document
+    /// introduces: every beta operation declares an `ilert-beta` opt-in header
+    /// whose value is not interpreted. Filling it in is what keeps a beta
+    /// command the same amount of typing as a stable one; `--ilert-beta` is
+    /// still there for anyone who needs to send something else.
+    pub fn default_value(&self) -> Option<String> {
+        match self.schema.as_ref()?.get("default")? {
+            Value::String(s) => Some(crate::sanitize::terminal_text(s)),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,10 +225,10 @@ pub fn load_cached_index(base_url: &str) -> Result<Option<OperationIndex>> {
 /// Ensure we have a fresh spec. Fetches if missing or stale, returns the index.
 pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
     let cache_path = cache_file_path(base_url)?;
-    // Resolved through the same gate as every other request rather than
-    // concatenated: the spec decides which commands exist, so fetching it from
-    // the wrong origin is worse than sending one request there.
-    let spec_url = Endpoint::parse(base_url)?.resolve("/api-docs/openapi.json")?;
+    // Validated here rather than only on the fetch path, so a base URL the CLI
+    // would refuse to send anything to is refused the same way whether or not
+    // this environment happens to have a cached spec.
+    Endpoint::parse(base_url)?;
 
     // Try cache first. An unusable one reads as absent, so it falls through to
     // the fetch below and is replaced rather than becoming an error.
@@ -165,7 +238,7 @@ pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
         }
         // Stale — try refresh, fall back to stale
         eprintln!("Note: API spec cache is stale, refreshing...");
-        if let Ok(fresh) = fetch_spec(&spec_url).await {
+        if let Ok(fresh) = fetch_merged_spec(base_url).await {
             save_to_cache(&cache_path, &fresh)?;
             return build_index(&fresh);
         }
@@ -174,11 +247,51 @@ pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
     }
 
     // No cache, or none we can use — must fetch
-    let spec = fetch_spec(&spec_url)
+    let spec = fetch_merged_spec(base_url)
         .await
         .context("Failed to fetch API spec. Check your network connection.")?;
     save_to_cache(&cache_path, &spec)?;
     build_index(&spec)
+}
+
+/// The document the rest of the CLI works from: the stable spec with the beta
+/// spec merged into it.
+///
+/// The stable document is what the CLI is; failing to fetch it is a failure.
+/// The beta one is additive, so a deployment that does not serve it answers
+/// `404` and that is not an error — it is an environment with no beta
+/// endpoints, which is exactly what a self-hosted or older ilert is. Any other
+/// failure is reported once and then treated the same way, because a
+/// stable-only CLI still does everything it did before beta existed.
+pub(crate) async fn fetch_merged_spec(base_url: &str) -> Result<Value> {
+    // Both URLs are resolved through the same gate as every other request
+    // rather than concatenated: the spec decides which commands exist, so
+    // fetching it from the wrong origin is worse than sending one request there.
+    let endpoint = Endpoint::parse(base_url)?;
+    let stable = fetch_spec(&endpoint.resolve(STABLE_SPEC_PATH)?).await?;
+    let beta = fetch_beta_spec(&endpoint).await;
+    Ok(merge_specs(stable, beta))
+}
+
+/// The beta document, or nothing — this never fails the command that needed it.
+async fn fetch_beta_spec(endpoint: &Endpoint) -> Option<Value> {
+    if std::env::var_os(NO_BETA_ENV).is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+
+    let url = endpoint.resolve(BETA_SPEC_PATH).ok()?;
+    match fetch_optional_spec(&url).await {
+        Ok(spec) => spec,
+        Err(e) => {
+            eprintln!(
+                "{} Could not fetch the beta API spec from {url}: {} Beta endpoints \
+                 will not be available.",
+                "Warning:".yellow().bold(),
+                crate::sanitize::terminal_string(e.to_string()),
+            );
+            None
+        }
+    }
 }
 
 /// Fetch and parse the OpenAPI document.
@@ -190,6 +303,18 @@ pub async fn ensure_spec(base_url: &str) -> Result<OperationIndex> {
 /// endpoint hand spec authority to a host the profile never named), a timeout,
 /// an explicit status check, and a ceiling on how much we will read.
 pub(crate) async fn fetch_spec(url: &url::Url) -> Result<Value> {
+    let spec = fetch_spec_inner(url, false).await?;
+    Ok(spec.expect("only a fetch allowed to come back empty can come back empty"))
+}
+
+/// [`fetch_spec`], except that a `404` reads as "this deployment does not serve
+/// that document" rather than as a failure. For the beta spec, which not every
+/// ilert publishes.
+async fn fetch_optional_spec(url: &url::Url) -> Result<Option<Value>> {
+    fetch_spec_inner(url, true).await
+}
+
+async fn fetch_spec_inner(url: &url::Url, missing_on_404: bool) -> Result<Option<Value>> {
     let client = crate::client::builder()
         .timeout(SPEC_FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -198,6 +323,9 @@ pub(crate) async fn fetch_spec(url: &url::Url) -> Result<Value> {
     let mut response = client.get(url.clone()).send().await?;
 
     let status = response.status();
+    if missing_on_404 && status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !status.is_success() {
         // Report the redirect rather than letting it look like a server error:
         // "the spec moved" is a different problem from "the spec is broken".
@@ -230,7 +358,429 @@ pub(crate) async fn fetch_spec(url: &url::Url) -> Result<Value> {
     }
 
     serde_json::from_slice(&body)
+        .map(Some)
         .map_err(|e| CliError::user(format!("The API spec at {url} is not valid JSON: {e}")).into())
+}
+
+/// Fold the beta document into the stable one, producing the single OpenAPI
+/// document everything downstream consumes: the cache file, the index, the
+/// command tree, `ops`, the preview.
+///
+/// A pure `Value -> Value` step slotted between the fetch and the cache write
+/// is the whole design: nothing after it has to learn that there were ever two
+/// documents. What it has to get right is the handful of places where two
+/// specs collide — see the four helpers below.
+pub(crate) fn merge_specs(stable: Value, beta: Option<Value>) -> Value {
+    let mut merged = stable;
+    if !merged.is_object() {
+        // Not a document at all. Left exactly as it arrived so `build_index`
+        // is the one place that reports what is wrong with it.
+        return merged;
+    }
+
+    let mut versions = serde_json::Map::new();
+    if let Some(version) = spec_version_of(&merged) {
+        versions.insert("stable".to_string(), Value::String(version));
+    }
+
+    stamp_base_path(&mut merged);
+
+    if let Some(mut beta) = beta.filter(Value::is_object) {
+        // Recorded only on success. A beta fetch that failed leaves the key
+        // absent, so the next freshness check sees a difference and refetches
+        // rather than sitting on a spec-minus-beta for the whole TTL.
+        if let Some(version) = spec_version_of(&beta) {
+            versions.insert("beta".to_string(), Value::String(version));
+        }
+        stamp_base_path(&mut beta);
+        namespace_components(&mut beta);
+        stamp_beta_operations(&mut beta);
+        report_taken_operation_ids(&merged, &beta);
+        merge_paths(&mut merged, &beta);
+        merge_components(&mut merged, &beta);
+    }
+
+    merged[SPEC_VERSIONS_KEY] = Value::Object(versions);
+    merged
+}
+
+/// Move the document's server base path onto its operations and empty
+/// `servers`.
+///
+/// `build_index` prepends `servers[0].url` to every path, and two documents can
+/// state two different prefixes — so the prefix has to travel with the
+/// operation rather than with the document. Done for the stable document too,
+/// even when there is no beta one, so there is a single code path.
+///
+/// The `paths` keys are deliberately left as authored: [`operation_id`]
+/// synthesizes ids from them, and rewriting the keys would rename every
+/// operation in the CLI.
+fn stamp_base_path(spec: &mut Value) {
+    let prefix = server_prefix(spec);
+    for (_, _, op) in operations_mut(spec) {
+        op.insert(
+            SPEC_BASE_PATH_KEY.to_string(),
+            Value::String(prefix.clone()),
+        );
+    }
+    spec["servers"] = Value::Array(Vec::new());
+}
+
+/// Mark every beta operation as one.
+fn stamp_beta_operations(beta: &mut Value) {
+    for (_, _, op) in operations_mut(beta) {
+        op.insert(
+            SPEC_ORIGIN_KEY.to_string(),
+            Value::String(BETA_ORIGIN.to_string()),
+        );
+    }
+}
+
+/// Rename everything the beta document defines under `components`, and rewrite
+/// every `$ref` in it to match.
+///
+/// `resolve_refs` follows `#/components/schemas/X` against the whole merged
+/// document, so two definitions of one name cannot coexist there — the second
+/// does not lose an argument with the first, it replaces it, and the damage
+/// lands on the *stable* command that pointed at the original. Namespacing
+/// makes that class of bug impossible rather than merely unlikely.
+fn namespace_components(beta: &mut Value) {
+    namespace_refs(beta);
+
+    for section in COMPONENT_SECTIONS {
+        let Some(components) = beta
+            .get_mut("components")
+            .and_then(|c| c.get_mut(section))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        *components = components
+            .iter()
+            .map(|(name, value)| (format!("{BETA_NAMESPACE}{name}"), value.clone()))
+            .collect();
+    }
+}
+
+/// The `components` sections a `$ref` in either document can point into. The
+/// specs use no others; one that appeared would keep its own name and simply
+/// not be namespaced, which is the same position we were in before.
+const COMPONENT_SECTIONS: [&str; 2] = ["schemas", "parameters"];
+
+fn namespace_refs(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "$ref"
+                    && let Some(target) = child.as_str()
+                    && let Some(renamed) = namespaced_ref(target)
+                {
+                    *child = Value::String(renamed);
+                    continue;
+                }
+                namespace_refs(child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(namespace_refs),
+        _ => {}
+    }
+}
+
+/// `#/components/schemas/Postmortem` -> `#/components/schemas/beta.Postmortem`.
+///
+/// Only the component's own name is prefixed, so a pointer that continues into
+/// the definition (`.../Postmortem/properties/id`) still lands where it did.
+fn namespaced_ref(target: &str) -> Option<String> {
+    COMPONENT_SECTIONS.iter().find_map(|section| {
+        let head = format!("#/components/{section}/");
+        let rest = target.strip_prefix(&head)?;
+        Some(format!("{head}{BETA_NAMESPACE}{rest}"))
+    })
+}
+
+/// Merge the beta document's paths in, one method at a time.
+///
+/// Per `(path, method)` rather than per path: a beta document that adds
+/// `POST /x` to a path the stable one already serves as `GET /x` must not take
+/// the stable `GET` with it. A genuine conflict — the same method on the same
+/// endpoint in both — is resolved in the stable document's favour, since that
+/// is the contract the CLI has been shipping.
+///
+/// A shared `paths` key is not by itself a shared endpoint. Each document
+/// states its own server prefix, so a stable `/incidents` under `/api` and a
+/// beta `/incidents` under `/api/beta` are two different endpoints that happen
+/// to be written the same way. Treating that as a conflict would drop the beta
+/// endpoint on the floor, so it is re-keyed by its full path instead — which is
+/// what the key already is for every document whose prefix matches.
+fn merge_paths(merged: &mut Value, beta: &Value) {
+    let Some(beta_paths) = beta.get("paths").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(paths) = ensure_object(merged, &["paths"]) else {
+        return;
+    };
+
+    for (path, beta_item) in beta_paths {
+        let Some(beta_item) = beta_item.as_object() else {
+            continue;
+        };
+        // Resolved before the borrow of `paths` that the merge below needs, so
+        // the decision and the write do not overlap.
+        let existing_base = paths
+            .get(path)
+            .and_then(Value::as_object)
+            .map(item_base_path);
+        let beta_base = item_base_path(beta_item);
+
+        match existing_base {
+            None => {
+                paths.insert(path.clone(), Value::Object(beta_item.clone()));
+                continue;
+            }
+            // Same key, different endpoint.
+            Some(existing_base) if existing_base != beta_base => {
+                let key = format!("{beta_base}{path}");
+                if paths.contains_key(&key) {
+                    eprintln!(
+                        "Warning: the beta API spec describes {} under a prefix the stable \
+                         spec already uses; dropping it.",
+                        crate::sanitize::terminal_text(&key),
+                    );
+                    continue;
+                }
+                // The key now carries the prefix, so the operations must not
+                // carry it a second time.
+                paths.insert(key, rebased_item(beta_item));
+                continue;
+            }
+            Some(_) => {}
+        }
+
+        let Some(existing) = paths.get_mut(path).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (method, operation) in beta_item {
+            // Only operations are carried over. A path-item level key on a path
+            // both documents describe (`parameters`, `summary`) would apply to
+            // the stable operations too, which is not what the beta document
+            // said.
+            if !is_http_method(method) {
+                continue;
+            }
+            if existing.contains_key(method) {
+                eprintln!(
+                    "Warning: the beta API spec redefines {} {}; keeping the stable definition.",
+                    method.to_uppercase(),
+                    crate::sanitize::terminal_text(path),
+                );
+                continue;
+            }
+            existing.insert(method.clone(), operation.clone());
+        }
+    }
+}
+
+/// Say so when the beta document asks for an operation id that already means
+/// something.
+///
+/// [`build_index`] namespaces it either way — that is the enforcement, and it
+/// runs against whatever document is on disk. This is the line that says it
+/// happened, printed where a spec is fetched rather than on every command.
+fn report_taken_operation_ids(merged: &Value, beta: &Value) {
+    let reserved = reserved_operation_ids(merged);
+    for (path, method, op_value) in operations(beta) {
+        let id = operation_id(method, path, op_value);
+        if reserved.contains(&id) {
+            eprintln!(
+                "Warning: the beta API spec claims the operation id '{}', which already \
+                 belongs to the stable API; it is indexed under a '{BETA_NAMESPACE}' prefix.",
+                crate::sanitize::terminal_text(&id),
+            );
+        }
+    }
+}
+
+/// The server prefix the operations of a path item were stamped with, or `""`.
+///
+/// Read off the first operation: every operation in a document is stamped with
+/// that document's prefix, and a path item only ever holds operations from one
+/// document — [`merge_paths`] re-keys the item rather than mixing two.
+fn item_base_path(item: &serde_json::Map<String, Value>) -> String {
+    item.iter()
+        .filter(|(method, _)| is_http_method(method))
+        .find_map(|(_, op)| op.get(SPEC_BASE_PATH_KEY)?.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A path item whose key has taken over its prefix: the operations are stamped
+/// with an empty one, so `build_index` prepends nothing to a key that is
+/// already the full path.
+fn rebased_item(item: &serde_json::Map<String, Value>) -> Value {
+    let mut item = item.clone();
+    for (method, operation) in item.iter_mut() {
+        if !is_http_method(method) {
+            continue;
+        }
+        if let Some(operation) = operation.as_object_mut() {
+            operation.insert(SPEC_BASE_PATH_KEY.to_string(), Value::String(String::new()));
+        }
+    }
+    Value::Object(item)
+}
+
+/// Merge the beta document's components in. Its names are namespaced by now, so
+/// a collision here would mean the stable document itself defines a `beta.`
+/// name — in which case the one that was already there wins, like everywhere
+/// else in this merge.
+fn merge_components(merged: &mut Value, beta: &Value) {
+    for section in COMPONENT_SECTIONS {
+        let Some(beta_section) = beta
+            .get("components")
+            .and_then(|c| c.get(section))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        if beta_section.is_empty() {
+            continue;
+        }
+        let Some(target) = ensure_object(merged, &["components", section]) else {
+            continue;
+        };
+        for (name, definition) in beta_section {
+            if !target.contains_key(name) {
+                target.insert(name.clone(), definition.clone());
+            }
+        }
+    }
+}
+
+/// Every operation in a document, as `(path, method, operation)`.
+fn operations(spec: &Value) -> impl Iterator<Item = (&String, &String, &Value)> {
+    spec.get("paths")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|paths| {
+            paths.iter().flat_map(|(path, item)| {
+                item.as_object()
+                    .into_iter()
+                    .flat_map(move |methods| methods.iter().map(move |(m, op)| (path, m, op)))
+            })
+        })
+        .filter(|(_, method, _)| is_http_method(method))
+}
+
+/// Every operation object in a document, as `(path, method, operation)`.
+fn operations_mut(
+    spec: &mut Value,
+) -> impl Iterator<Item = (String, String, &mut serde_json::Map<String, Value>)> {
+    spec.get_mut("paths")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|paths| {
+            paths.iter_mut().flat_map(|(path, item)| {
+                let path = path.clone();
+                item.as_object_mut().into_iter().flat_map(move |methods| {
+                    let path = path.clone();
+                    methods
+                        .iter_mut()
+                        .filter(|(method, _)| is_http_method(method))
+                        .filter_map(move |(method, op)| {
+                            Some((path.clone(), method.clone(), op.as_object_mut()?))
+                        })
+                })
+            })
+        })
+}
+
+/// The object at `path`, creating empty objects along the way. `None` when
+/// something on the way is present and is not an object.
+fn ensure_object<'a>(
+    value: &'a mut Value,
+    path: &[&str],
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let mut current = value.as_object_mut()?;
+    for key in path {
+        current = current
+            .entry(*key)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()?;
+    }
+    Some(current)
+}
+
+pub(crate) fn is_http_method(method: &str) -> bool {
+    matches!(method, "get" | "head" | "post" | "put" | "patch" | "delete")
+}
+
+/// The server base path a document declares, validated.
+///
+/// Only a path-only `servers[0].url` counts; a full URL names a host, and the
+/// host a request goes to is the profile's to decide, not the spec's.
+///
+/// `servers[0].url` is prepended to every path, so a hostile one poisons the
+/// whole document at once — `"//evil.example"` would turn each path into a
+/// scheme-relative URL. Checked here, once, so the failure is reported once and
+/// names the real culprit instead of appearing per path.
+fn server_prefix(spec: &Value) -> String {
+    let declared = spec
+        .get("servers")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.get("url"))
+        .and_then(|u| u.as_str())
+        .filter(|u| u.starts_with('/'))
+        .map(|u| u.trim_end_matches('/'))
+        .unwrap_or("");
+
+    if declared.is_empty() {
+        return String::new();
+    }
+    if let Err(e) = crate::endpoint::validate_request_path(declared) {
+        // The warning quotes the very string that failed validation, which is
+        // the string most likely to be hostile — a rejected path that clears
+        // the screen on its way to being reported would hide the report.
+        eprintln!(
+            "Warning: ignoring API spec server base path '{}': {}",
+            crate::sanitize::terminal_text(declared),
+            crate::sanitize::terminal_string(e.to_string())
+        );
+        return String::new();
+    }
+    declared.to_string()
+}
+
+/// `info.version`, the version a document is known by.
+fn spec_version_of(spec: &Value) -> Option<String> {
+    spec.get("info")?.get("version")?.as_str().map(String::from)
+}
+
+/// The version of each document a spec was built from.
+///
+/// A spec cached before the merge existed carries no map, so its `info.version`
+/// stands in as the stable one — otherwise the first check after an upgrade
+/// would report a change that never happened.
+pub(crate) fn spec_versions(spec: &Value) -> BTreeMap<String, String> {
+    if let Some(map) = spec.get(SPEC_VERSIONS_KEY).and_then(|v| v.as_object()) {
+        return map
+            .iter()
+            .filter_map(|(name, version)| Some((name.clone(), version.as_str()?.to_string())))
+            .collect();
+    }
+    spec_version_of(spec)
+        .map(|version| BTreeMap::from([("stable".to_string(), version)]))
+        .unwrap_or_default()
+}
+
+/// How a set of spec versions reads in output: the API's own version, with the
+/// beta document's alongside it when there is one.
+pub(crate) fn spec_version_display(versions: &BTreeMap<String, String>) -> Option<String> {
+    let stable = versions.get("stable")?;
+    Some(match versions.get("beta") {
+        Some(beta) => format!("{stable} (beta {beta})"),
+        None => stable.clone(),
+    })
 }
 
 fn spec_too_large(url: &url::Url) -> anyhow::Error {
@@ -318,16 +868,19 @@ pub(crate) fn cached_spec_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// `info.version` of the spec cached for `base_url`, if there is one.
+/// The version of the spec cached for `base_url`, if there is one — the API's
+/// own version, and the beta document's when that environment serves one.
 pub(crate) fn cached_spec_version(base_url: &str) -> Option<String> {
+    spec_version_display(&spec_versions(&read_cached_spec(base_url)?))
+}
+
+/// The cached spec for `base_url`, parsed. A cache that cannot be read or
+/// parsed reads as absent; every caller here is reporting state, not relying on
+/// it, and `load_index_from_cache` is where an unusable one is dealt with.
+pub(crate) fn read_cached_spec(base_url: &str) -> Option<Value> {
     let path = cache_file_path(base_url).ok()?;
     let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Value>(&content)
-        .ok()?
-        .get("info")?
-        .get("version")?
-        .as_str()
-        .map(String::from)
+    serde_json::from_str::<Value>(&content).ok()
 }
 
 /// Read the cached spec as a usable index, treating one that cannot be read —
@@ -410,75 +963,49 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
         .and_then(|v| v.as_object())
         .ok_or_else(|| CliError::user("Invalid OpenAPI spec: missing 'paths'"))?;
 
-    // Extract server base path (e.g., "/api" from servers[0].url)
-    let server_base = spec
-        .get("servers")
-        .and_then(|s| s.as_array())
-        .and_then(|a| a.first())
-        .and_then(|s| s.get("url"))
-        .and_then(|u| u.as_str())
-        .and_then(|u| {
-            // Only use path-only server URLs (relative paths like "/api")
-            // Skip full URLs like "https://api.ilert.com/api"
-            if u.starts_with('/') {
-                Some(u.trim_end_matches('/'))
-            } else {
-                None
-            }
-        })
-        .unwrap_or("");
+    // A merged document states each operation's base path on the operation
+    // itself, since the two specs it was built from can declare different ones.
+    // `servers[0].url` is the fallback, and it is what a spec cached by an
+    // older build of this CLI still carries.
+    let document_base = server_prefix(spec);
 
-    // `servers[0].url` is prepended to every path, so a hostile one poisons the
-    // whole document at once — `"//evil.example"` would turn each path into a
-    // scheme-relative URL. Checked on its own so the failure is reported once
-    // and names the real culprit, instead of once per path.
-    let server_base = match crate::endpoint::validate_request_path(server_base) {
-        _ if server_base.is_empty() => "",
-        Ok(()) => server_base,
-        Err(e) => {
-            // The warning quotes the very string that failed validation, which
-            // is the string most likely to be hostile — a rejected path that
-            // clears the screen on its way to being reported would hide the
-            // report.
-            eprintln!(
-                "Warning: ignoring API spec server base path '{}': {}",
-                crate::sanitize::terminal_text(server_base),
-                crate::sanitize::terminal_string(e.to_string())
-            );
-            ""
-        }
-    };
+    // `by_id` is dispatch: `ops run <id>` sends what it finds there, and
+    // `OPERATION_OVERRIDES` decides what needs a `--yes` by the same key. So an
+    // id is authority, and the beta half of a document does not get to take one
+    // that already means something in the stable half.
+    let mut claimed_ids = reserved_operation_ids(spec);
 
     let mut by_id: HashMap<String, Operation> = HashMap::new();
     let mut by_tag: HashMap<String, Vec<Operation>> = HashMap::new();
-    let mut action_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
     for (path, methods) in paths {
-        let full_path = format!("{server_base}{path}");
-        // Checked here so a path that could re-target a request never becomes a
-        // command at all — `ilert alerts list` cannot be made to send the
-        // caller's token to `//evil.example` if the operation does not exist.
-        // Dropped rather than fatal: one malformed key in a spec we did not
-        // write should not take the whole CLI down with it, and
-        // `HttpClient::request_raw` refuses the same path again anyway.
-        if let Err(e) = validate_spec_path(&full_path) {
-            eprintln!(
-                "Warning: ignoring API spec path '{}': {}",
-                crate::sanitize::terminal_text(path),
-                crate::sanitize::terminal_string(e.to_string())
-            );
-            continue;
-        }
         let methods = match methods.as_object() {
             Some(m) => m,
             None => continue,
         };
 
         for (method, op_value) in methods {
-            if !matches!(
-                method.as_str(),
-                "get" | "head" | "post" | "put" | "patch" | "delete"
-            ) {
+            if !is_http_method(method) {
+                continue;
+            }
+
+            let base = op_value
+                .get(SPEC_BASE_PATH_KEY)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&document_base);
+            let full_path = format!("{base}{path}");
+            // Checked here so a path that could re-target a request never
+            // becomes a command at all — `ilert alerts list` cannot be made to
+            // send the caller's token to `//evil.example` if the operation does
+            // not exist. Dropped rather than fatal: one malformed key in a spec
+            // we did not write should not take the whole CLI down with it, and
+            // `HttpClient::request_raw` refuses the same path again anyway.
+            if let Err(e) = validate_spec_path(&full_path) {
+                eprintln!(
+                    "Warning: ignoring API spec path '{}': {}",
+                    crate::sanitize::terminal_text(&full_path),
+                    crate::sanitize::terminal_string(e.to_string())
+                );
                 continue;
             }
 
@@ -493,9 +1020,21 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
             let tag_normalized = normalize_tag(&tag);
             let action = derive_action(method, path);
 
-            let operation_id = operation_id(method, path, op_value);
+            let beta = op_value.get(SPEC_ORIGIN_KEY).and_then(|v| v.as_str()) == Some(BETA_ORIGIN);
+            // Settled before the operation is classified, not after: a beta
+            // operation that kept a stable id long enough to be classified
+            // would inherit that id's `OPERATION_OVERRIDES` entry, and two of
+            // those entries mark a `POST` as read-only — which is the
+            // difference between a command that asks for confirmation and one
+            // that does not.
+            let operation_id = match beta {
+                true => {
+                    claim_beta_operation_id(operation_id(method, path, op_value), &mut claimed_ids)
+                }
+                false => operation_id(method, path, op_value),
+            };
 
-            let parameters = extract_parameters(op_value);
+            let parameters = extract_parameters(op_value, spec);
             let request_body = op_value.get("requestBody");
             let has_request_body = request_body.is_some();
             let request_body_required = request_body
@@ -528,36 +1067,38 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
                 has_request_body,
                 request_body_required,
                 classification: classification::for_operation(method, &operation_id, op_value)?,
+                beta,
             };
-
-            // Track action counts for collision handling
-            *action_counts
-                .entry(tag_normalized.clone())
-                .or_default()
-                .entry(action.clone())
-                .or_insert(0) += 1;
 
             by_id.insert(operation_id, op.clone());
             by_tag.entry(tag_normalized).or_default().push(op);
         }
     }
 
-    // Resolve action name collisions within tags
-    for (tag, ops) in &mut by_tag {
-        let counts = action_counts.get(tag.as_str()).cloned().unwrap_or_default();
-        let mut seen: HashMap<String, usize> = HashMap::new();
+    // Settle the command names within each tag.
+    for ops in by_tag.values_mut() {
+        // Stable operations first, so the un-suffixed name — `list`, `get` —
+        // goes to the one that already had it. Names are claimed in the order
+        // walked here, and `paths` iterates in sorted key order, so without
+        // this a purely additive beta document could rename an existing command
+        // by sorting ahead of it. A stable sort, so the order within each half
+        // is still the spec's own.
+        ops.sort_by_key(|op| op.beta);
 
+        let mut claimed: HashSet<String> = HashSet::new();
         for op in ops.iter_mut() {
-            if let Some(&count) = counts.get(&op.action)
-                && count > 1
-            {
-                let idx = seen.entry(op.action.clone()).or_insert(0);
-                if *idx > 0 {
-                    // Append path tail for disambiguation
-                    let suffix = path_suffix(&op.path);
-                    op.action = format!("{}-{suffix}", op.action);
-                }
-                *idx += 1;
+            op.action = claim_action(&op.action, &op.path, &mut claimed);
+        }
+    }
+
+    // `by_id` holds copies taken before the names were settled. Bring them up
+    // to date, so `ops show <id>` and `ops list` name the same command the
+    // command tree does rather than the one it would have been without a
+    // collision.
+    for ops in by_tag.values() {
+        for op in ops {
+            if let Some(indexed) = by_id.get_mut(&op.id) {
+                indexed.action.clone_from(&op.action);
             }
         }
     }
@@ -614,17 +1155,100 @@ fn slugify_path(path: &str) -> String {
         .replace(['{', '}'], "")
 }
 
-/// The tail segment a colliding action is disambiguated by. Part of a command
-/// name, so it is escaped for the same reason [`normalize_tag`] is.
-fn path_suffix(path: &str) -> String {
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|s| !s.is_empty() && !s.starts_with('{'))
+/// Every operation id that already means something without the beta document.
+///
+/// Two sources, and both are authority: the ids the stable half of this
+/// document produces, and every id [`classification::OPERATION_OVERRIDES`]
+/// names — including one an older stable spec has since dropped, which would
+/// otherwise be free for a beta operation to claim along with its
+/// classification.
+fn reserved_operation_ids(spec: &Value) -> HashSet<String> {
+    let mut reserved: HashSet<String> = classification::OPERATION_OVERRIDES
+        .iter()
+        .map(|(id, _)| (*id).to_string())
         .collect();
-    crate::sanitize::terminal_string(segments.last().unwrap_or(&"unknown").to_lowercase())
+
+    for (path, method, op_value) in operations(spec) {
+        if op_value.get(SPEC_ORIGIN_KEY).and_then(|v| v.as_str()) == Some(BETA_ORIGIN) {
+            continue;
+        }
+        reserved.insert(operation_id(method, path, op_value));
+    }
+    reserved
 }
 
-fn extract_parameters(op: &Value) -> Vec<Parameter> {
+/// The id a beta operation is indexed under: the one it asked for if nothing
+/// else has it, and a namespaced one otherwise.
+///
+/// Renamed rather than dropped — the operation is a command like any other, and
+/// it stays reachable under the id `ops list` reports for it. What it does not
+/// get is an id whose meaning was established elsewhere.
+fn claim_beta_operation_id(id: String, claimed: &mut HashSet<String>) -> String {
+    if claimed.insert(id.clone()) {
+        return id;
+    }
+    let namespaced = format!("{BETA_NAMESPACE}{id}");
+    if claimed.insert(namespaced.clone()) {
+        return namespaced;
+    }
+    for n in 2.. {
+        let numbered = format!("{namespaced}-{n}");
+        if claimed.insert(numbered.clone()) {
+            return numbered;
+        }
+    }
+    unreachable!("the numbered candidates never run out")
+}
+
+/// The command name an operation gets inside its tag: its action, or — when
+/// something already holds that name — the shortest name built from the tail of
+/// its path that nothing holds yet.
+///
+/// The check is on the *final* name, not on the action it started from. One
+/// suffix is not always enough to separate two operations: the stable spec
+/// alone puts `.../messages/{id}/reactions` and
+/// `.../thread-replies/{id}/reactions` in one tag, and both wanted
+/// `create-reactions`. Two commands of the same name is not a cosmetic problem
+/// — `clap` refuses to build a command with a duplicated subcommand, so
+/// `ilert chat-messages --help` panicked outright. A second document merged
+/// into the tree only makes the collisions more likely.
+///
+/// Names are claimed in the order the caller walks the tag, which is stable
+/// operations first — so the shortest name goes to the command that already had
+/// it, and a beta endpoint takes a longer one.
+///
+/// Each candidate is escaped for the same reason [`normalize_tag`] is: it
+/// becomes a command name, an index key and a line of `--help`, and all three
+/// have to be the same string.
+fn claim_action(action: &str, path: &str, claimed: &mut HashSet<String>) -> String {
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty() && !s.starts_with('{'))
+        .map(|s| crate::sanitize::terminal_string(s.to_lowercase()))
+        .collect();
+
+    // `list`, then `list-incidents`, then `list-beta-incidents`: more of the
+    // path each time, because a name that says which endpoint it is beats a
+    // number that does not.
+    let candidates = std::iter::once(action.to_string())
+        .chain((1..=segments.len()).map(|take| {
+            let tail = segments[segments.len() - take..].join("-");
+            format!("{action}-{tail}")
+        }))
+        // Only reachable if a document describes the same endpoint twice, which
+        // no name drawn from the path can separate. Unbounded, so this always
+        // terminates with a name.
+        .chain((2..).map(|n| format!("{action}-{n}")));
+
+    let name = candidates
+        .into_iter()
+        .find(|candidate| !claimed.contains(candidate))
+        .expect("the numbered candidates never run out");
+    claimed.insert(name.clone());
+    name
+}
+
+fn extract_parameters(op: &Value, spec: &Value) -> Vec<Parameter> {
     let params = match op.get("parameters").and_then(|v| v.as_array()) {
         Some(p) => p,
         None => return Vec::new(),
@@ -633,6 +1257,13 @@ fn extract_parameters(op: &Value) -> Vec<Parameter> {
     params
         .iter()
         .filter_map(|p| {
+            // A `$ref`'d parameter is a parameter. This used to return `None`
+            // for one — `p.get("name")` on a `{"$ref": ...}` is nothing — which
+            // was invisible only for as long as every operation inlined all of
+            // its parameters. The beta document declares its opt-in header once
+            // and points every operation at it, so a walk that did not follow
+            // the pointer would drop a required header from every beta command.
+            let p = &dereference(p, spec);
             // A parameter name becomes a `--flag`, a lookup key in
             // `RequestParams::from_operation`, and a query-string key on the
             // wire. Escaping it here keeps all three the same string.
@@ -733,6 +1364,26 @@ fn resolve_refs_depth(schema: &Value, spec: &Value, depth: u32) -> Value {
     schema.clone()
 }
 
+/// Resolve a `$ref` wrapper to what it points at, leaving anything else alone.
+///
+/// Bounded rather than recursive-until-done: a document is free to point one
+/// `$ref` at another, and a cycle is a document we still have to survive.
+fn dereference<'a>(value: &'a Value, spec: &'a Value) -> &'a Value {
+    let mut current = value;
+    for _ in 0..MAX_REF_HOPS {
+        let Some(target) = current.get("$ref").and_then(|v| v.as_str()) else {
+            return current;
+        };
+        let Some(next) = follow_ref(target, spec) else {
+            return current;
+        };
+        current = next;
+    }
+    current
+}
+
+const MAX_REF_HOPS: usize = 8;
+
 /// Follow a JSON Pointer-style $ref like "#/components/schemas/Event".
 fn follow_ref<'a>(ref_path: &str, spec: &'a Value) -> Option<&'a Value> {
     let path = ref_path.strip_prefix("#/")?;
@@ -823,6 +1474,360 @@ mod tests {
         );
     }
 
+    /// The merge is the one place two documents meet, so what it has to get
+    /// right is everything that is only a question when there are two of them:
+    /// sibling methods, component names, command names, and each document's own
+    /// server prefix.
+    mod merging {
+        use super::super::{build_index, merge_specs, spec_version_display, spec_versions};
+        use serde_json::{Value, json};
+
+        fn stable() -> Value {
+            json!({
+                "info": {"version": "stable-1"},
+                "servers": [{"url": "/api"}],
+                "paths": {
+                    "/alerts": {"get": {"tags": ["Alerts"], "summary": "List alerts"}},
+                    "/incidents": {"get": {"tags": ["Incidents"], "summary": "List incidents"}, "post": {
+                        "tags": ["Incidents"],
+                        "requestBody": {"content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Incident"}
+                        }}}
+                    }}
+                },
+                "components": {"schemas": {"Incident": {
+                    "type": "object",
+                    "properties": {"stableOnly": {"type": "string"}}
+                }}}
+            })
+        }
+
+        fn beta() -> Value {
+            json!({
+                "info": {"version": "beta-1"},
+                "servers": [{"url": "/api"}],
+                "paths": {
+                    // Sorts before `/incidents`, which is the case that decides
+                    // who keeps the `list` command name.
+                    "/beta/incidents": {"get": {"tags": ["Incidents"], "summary": "List incidents"}},
+                    // A method the stable document does not serve on a path it does.
+                    "/alerts": {"post": {
+                        "tags": ["Alerts"],
+                        "requestBody": {"content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Incident"}
+                        }}}
+                    }}
+                },
+                "components": {"schemas": {"Incident": {
+                    "type": "object",
+                    "properties": {"betaOnly": {"type": "string"}}
+                }}}
+            })
+        }
+
+        fn merged() -> Value {
+            merge_specs(stable(), Some(beta()))
+        }
+
+        fn body_properties(spec: &Value, id: &str) -> Vec<String> {
+            let index = build_index(spec).expect("the merged document indexes");
+            let op = index.by_id.get(id).unwrap_or_else(|| panic!("no {id}"));
+            op.request_body_schema
+                .as_ref()
+                .and_then(|s| s.get("properties"))
+                .and_then(|p| p.as_object())
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+
+        /// A path-level insert would have dropped the stable `GET /alerts` on
+        /// the floor the moment beta added a `POST` to the same path.
+        #[test]
+        fn a_shared_path_keeps_both_documents_methods() {
+            let index = build_index(&merged()).expect("indexes");
+            assert!(
+                index.by_id.contains_key("get-alerts"),
+                "the stable GET is gone"
+            );
+            assert!(
+                index.by_id.contains_key("post-alerts"),
+                "the beta POST never arrived"
+            );
+        }
+
+        /// Both documents define `Incident`, and they are not the same shape.
+        /// `resolve_refs` follows a pointer against the whole merged document,
+        /// so an un-namespaced merge would not lose an argument here — it would
+        /// silently re-describe the *stable* command's request body.
+        #[test]
+        fn a_beta_schema_cannot_rewrite_the_stable_one_of_the_same_name() {
+            let merged = merged();
+            assert_eq!(body_properties(&merged, "post-incidents"), ["stableOnly"]);
+            assert_eq!(body_properties(&merged, "post-alerts"), ["betaOnly"]);
+        }
+
+        /// `paths` iterates in sorted key order, so `/beta/incidents` is reached
+        /// before `/incidents` — and the un-suffixed name goes to whichever
+        /// operation is reached first. A purely additive beta document must not
+        /// be able to rename a command that has been shipping.
+        #[test]
+        fn a_beta_operation_never_takes_a_stable_command_name() {
+            let index = build_index(&merged()).expect("indexes");
+            let stable_list = index
+                .find_by_tag_action("incidents", "list")
+                .expect("`incidents list` still exists");
+            assert_eq!(stable_list.path, "/api/incidents");
+            assert!(!stable_list.beta);
+
+            let beta_list = index
+                .find_by_tag_action("incidents", "list-incidents")
+                .expect("the beta list is offered under a suffixed name");
+            assert_eq!(beta_list.path, "/api/beta/incidents");
+            assert!(beta_list.beta);
+        }
+
+        /// The stable document is the contract the CLI has been shipping, so it
+        /// wins a genuine conflict — same method, same path, two definitions.
+        #[test]
+        fn the_stable_definition_wins_a_real_conflict() {
+            let mut beta = beta();
+            beta["paths"]["/alerts"] = json!({
+                "get": {"tags": ["Alerts"], "summary": "Beta's own list alerts"}
+            });
+
+            let index = build_index(&merge_specs(stable(), Some(beta))).expect("indexes");
+            let op = index
+                .by_id
+                .get("get-alerts")
+                .expect("the stable GET survives");
+            assert_eq!(op.summary.as_deref(), Some("List alerts"));
+            assert!(!op.beta);
+        }
+
+        /// One `servers` array cannot describe two documents. Each operation
+        /// carries the prefix its own document declared, and the `paths` keys
+        /// stay as authored — an operation renamed by the merge would break
+        /// every `ops run <id>` and every classification override.
+        #[test]
+        fn each_document_keeps_its_own_server_prefix() {
+            let mut beta = beta();
+            beta["servers"] = json!([{"url": "/gateway"}]);
+
+            let index = build_index(&merge_specs(stable(), Some(beta))).expect("indexes");
+            assert_eq!(index.by_id["get-alerts"].path, "/api/alerts");
+            assert_eq!(
+                index.by_id["get-beta-incidents"].path,
+                "/gateway/beta/incidents"
+            );
+        }
+
+        /// The beta document is versioned separately, so a merged spec has to
+        /// record both — a beta-only bump that the freshness check could not
+        /// see would sit on disk for the whole TTL.
+        #[test]
+        fn the_merged_document_records_the_version_of_each_document() {
+            let versions = spec_versions(&merged());
+            assert_eq!(versions["stable"], "stable-1");
+            assert_eq!(versions["beta"], "beta-1");
+            assert_eq!(
+                spec_version_display(&versions).as_deref(),
+                Some("stable-1 (beta beta-1)")
+            );
+
+            // A beta fetch that failed leaves the key out, so the next check
+            // sees a difference and heals rather than caching a spec-minus-beta.
+            let versions = spec_versions(&merge_specs(stable(), None));
+            assert!(!versions.contains_key("beta"));
+            assert_eq!(spec_version_display(&versions).as_deref(), Some("stable-1"));
+
+            // A spec cached before the merge existed carries no map at all; its
+            // own version has to stand in, or the first check after an upgrade
+            // reports a change that never happened.
+            assert_eq!(spec_versions(&stable())["stable"], "stable-1");
+        }
+
+        /// A shared `paths` key is not a shared endpoint. Each document brings
+        /// its own server prefix, so `/incidents` under `/api` and `/incidents`
+        /// under `/api/beta` are two endpoints written the same way — and
+        /// reading that as a conflict silently dropped the beta one.
+        #[test]
+        fn the_same_path_key_under_two_prefixes_is_two_endpoints() {
+            let mut beta = beta();
+            beta["servers"] = json!([{"url": "/api/beta"}]);
+            beta["paths"] = json!({
+                "/incidents": {"get": {"tags": ["Incidents"], "summary": "List incidents (beta)"}}
+            });
+
+            let index = build_index(&merge_specs(stable(), Some(beta))).expect("indexes");
+            let stable_list = index
+                .find_by_tag_action("incidents", "list")
+                .expect("the stable endpoint is untouched");
+            assert_eq!(stable_list.path, "/api/incidents");
+            assert!(!stable_list.beta);
+
+            let beta_list = index.by_tag["incidents"]
+                .iter()
+                .find(|op| op.beta)
+                .expect("the beta endpoint is a command, not a dropped conflict");
+            assert_eq!(beta_list.path, "/api/beta/incidents");
+            assert_eq!(beta_list.method, "GET");
+        }
+
+        /// Two commands of one name is not cosmetic: `clap` refuses to build a
+        /// command whose subcommands collide, so it takes out `--help` and
+        /// everything under that tag. One suffix is not always enough to
+        /// separate them — here the stable document already holds both `list`
+        /// and `list-incidents` before the beta endpoint asks for a name.
+        #[test]
+        fn a_beta_endpoint_cannot_land_on_a_name_that_is_taken() {
+            let mut stable = stable();
+            stable["paths"]["/reports/incidents"] =
+                json!({"get": {"tags": ["Incidents"], "summary": "Incident report"}});
+
+            let index = build_index(&merge_specs(stable, Some(beta()))).expect("indexes");
+            let named: Vec<(&str, &str)> = index.by_tag["incidents"]
+                .iter()
+                .map(|op| (op.action.as_str(), op.path.as_str()))
+                .collect();
+
+            let unique: std::collections::HashSet<&str> =
+                named.iter().map(|(action, _)| *action).collect();
+            assert_eq!(
+                unique.len(),
+                named.len(),
+                "duplicate command name in {named:?}"
+            );
+
+            // The two that were there keep the names they had...
+            assert!(named.contains(&("list", "/api/incidents")));
+            assert!(named.contains(&("list-incidents", "/api/reports/incidents")));
+            // ...and the newcomer takes one more of its own path.
+            assert!(named.contains(&("list-beta-incidents", "/api/beta/incidents")));
+        }
+
+        /// The classification table is written against ids, so an id it names
+        /// is reserved even when the stable document has since stopped
+        /// declaring it — two of those entries mark a `POST` as read-only, and
+        /// a beta write that inherited one would preview as a read and skip the
+        /// confirmation a write gets.
+        #[test]
+        fn a_beta_operation_cannot_take_an_id_the_classification_table_names() {
+            let mut beta = beta();
+            beta["paths"]["/beta/impostor"] = json!({"post": {
+                "operationId": "post-incidents-publish-info",
+                "tags": ["Alerts"]
+            }});
+
+            let index = build_index(&merge_specs(stable(), Some(beta))).expect("indexes");
+            assert!(
+                !index.by_id.contains_key("post-incidents-publish-info"),
+                "the beta operation took a reserved id"
+            );
+
+            let op = &index.by_id["beta.post-incidents-publish-info"];
+            assert!(op.beta);
+            assert!(
+                !op.classification.read_only,
+                "a write inherited the read-only classification of the id it asked for"
+            );
+        }
+
+        /// The beta document declares its opt-in header once and points every
+        /// operation at it. A parameter walk that did not follow the pointer
+        /// dropped a *required* header from every beta command — and the
+        /// failure would have arrived from the server, as a 4xx.
+        #[test]
+        fn a_referenced_parameter_reaches_the_operation() {
+            let mut beta = beta();
+            beta["components"]["parameters"] = json!({"IlertBetaHeader": {
+                "name": "ilert-beta",
+                "in": "header",
+                "required": true,
+                "schema": {"type": "string", "default": "v1"}
+            }});
+            beta["paths"]["/beta/incidents"]["get"]["parameters"] =
+                json!([{"$ref": "#/components/parameters/IlertBetaHeader"}]);
+
+            let index = build_index(&merge_specs(stable(), Some(beta))).expect("indexes");
+            let op = &index.by_id["get-beta-incidents"];
+            let header = op
+                .parameters
+                .iter()
+                .find(|p| p.name == "ilert-beta")
+                .expect("the referenced header is a parameter like any other");
+            assert!(header.required);
+            // ...and one the CLI fills in, so a beta command is no more typing
+            // than a stable one.
+            assert_eq!(header.default_value().as_deref(), Some("v1"));
+        }
+    }
+
+    /// Command names are settled inside a tag, and two operations can want the
+    /// same one without a beta document being involved at all.
+    mod naming {
+        use super::super::build_index;
+        use serde_json::json;
+
+        /// The shape the stable spec has shipped for as long as it has had
+        /// thread replies: `.../messages/{id}/reactions` and
+        /// `.../thread-replies/{id}/reactions` share their last segment, so one
+        /// suffix left both of them called `create-reactions` — and
+        /// `ilert chat-messages --help` panicked inside `clap` rather than
+        /// printing anything.
+        #[test]
+        fn operations_that_share_a_path_tail_still_get_distinct_names() {
+            let spec = json!({
+                "paths": {
+                    // The plain create takes the bare name, which is what left
+                    // the other two contending for the same suffixed one.
+                    "/messages": {
+                        "post": {"tags": ["Chat Messages"], "summary": "Post a message"}
+                    },
+                    "/messages/{id}/reactions": {
+                        "post": {"tags": ["Chat Messages"], "summary": "React to a message"}
+                    },
+                    "/messages/{threadId}/thread-replies/{id}/reactions": {
+                        "post": {"tags": ["Chat Messages"], "summary": "React to a reply"}
+                    }
+                }
+            });
+
+            let index = build_index(&spec).expect("indexes");
+            let actions: Vec<&str> = index.by_tag["chat-messages"]
+                .iter()
+                .map(|op| op.action.as_str())
+                .collect();
+            let unique: std::collections::HashSet<&&str> = actions.iter().collect();
+            assert_eq!(unique.len(), actions.len(), "duplicate name in {actions:?}");
+            assert!(
+                actions.contains(&"create")
+                    && actions.contains(&"create-reactions")
+                    && actions.contains(&"create-thread-replies-reactions"),
+                "got {actions:?}"
+            );
+        }
+
+        /// `ops show <id>` reads the operation out of `by_id`, which held a copy
+        /// taken before the names were settled — so it answered `list` for a
+        /// command the tree calls `list-incidents`.
+        #[test]
+        fn the_id_index_reports_the_name_the_command_tree_uses() {
+            let spec = json!({
+                "paths": {
+                    "/incidents": {"get": {"tags": ["Incidents"], "summary": "List"}},
+                    "/reports/incidents": {"get": {"tags": ["Incidents"], "summary": "Report"}}
+                }
+            });
+
+            let index = build_index(&spec).expect("indexes");
+            assert_eq!(index.by_id["get-incidents"].action, "list");
+            assert_eq!(
+                index.by_id["get-reports-incidents"].action,
+                "list-incidents"
+            );
+        }
+    }
+
     mod pagination {
         use crate::openapi::{Classification, Operation, ParamLocation, Parameter};
 
@@ -850,6 +1855,7 @@ mod tests {
                 has_request_body: false,
                 request_body_required: false,
                 classification: Classification::from_method("GET"),
+                beta: false,
             }
         }
 

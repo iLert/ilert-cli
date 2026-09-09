@@ -327,10 +327,18 @@ impl RequestParams {
 
         for param in &operation.parameters {
             let values = param_values(args, &overrides, param);
-            let value = values.first().map(String::as_str);
 
             match &param.location {
-                ParamLocation::Path => match value {
+                // No spec-supplied default here, deliberately. A path parameter
+                // names *which resource* the request acts on, and a default
+                // would let the document answer that question instead of the
+                // caller: an `id` default silently retargets a request the
+                // caller believed they had addressed. Worst under `--stdin`,
+                // where the path is left templated so each line can substitute
+                // its own id — a default fills the template in before the batch
+                // starts, and every line goes to the same resource. Consent was
+                // given once, for a batch that no longer exists.
+                ParamLocation::Path => match values.first().map(String::as_str) {
                     Some(val) => {
                         let segment = path_segment(&param.name, val)?;
                         path = path.replace(&format!("{{{}}}", param.name), &segment);
@@ -347,6 +355,7 @@ impl RequestParams {
                     }
                 },
                 ParamLocation::Query => {
+                    let values = with_spec_default(param, values);
                     if values.is_empty() && param.required {
                         return Err(missing_parameter(operation, param, "query").into());
                     }
@@ -358,6 +367,7 @@ impl RequestParams {
                     }
                 }
                 ParamLocation::Header => {
+                    let values = with_spec_default(param, values);
                     if values.is_empty() && param.required {
                         return Err(missing_parameter(operation, param, "header").into());
                     }
@@ -404,6 +414,22 @@ impl RequestParams {
             body: self.body.clone(),
         }
     }
+}
+
+/// The values a query or header parameter travels with, falling back to the
+/// default the spec states for a required one.
+///
+/// A required parameter with a fixed default is filled in rather than demanded
+/// — the beta opt-in header is one, and asking for it on every beta command
+/// would be the difference between a beta command and a stable one. An optional
+/// parameter is left out entirely, which is what the server's own default is
+/// for, and a *path* parameter never comes through here at all: see the comment
+/// at the call site.
+fn with_spec_default(param: &Parameter, values: Vec<String>) -> Vec<String> {
+    if !values.is_empty() || !param.required {
+        return values;
+    }
+    param.default_value().into_iter().collect()
 }
 
 fn missing_parameter(operation: &Operation, param: &Parameter, location: &str) -> CliError {

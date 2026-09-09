@@ -24,6 +24,15 @@ const OPENAPI_SPEC: &str = include_str!("../fixtures/openapi.json");
 /// request body, and a header parameter with a reserved name.
 pub const CLASSIFICATION_SPEC: &str = include_str!("../fixtures/classification.json");
 
+/// A stand-in for the beta document ilert serves alongside the stable spec.
+pub const BETA_SPEC: &str = include_str!("../fixtures/beta.json");
+
+/// Where each document is served from. The beta one is optional: a deployment
+/// that does not publish it answers 404, which is what this harness does by
+/// default — most tests are about a CLI that has only the stable spec.
+pub const SPEC_PATH: &str = "/api-docs/openapi.json";
+pub const BETA_SPEC_PATH: &str = "/api/beta/openapi.json";
+
 /// Test harness that manages a wiremock server and isolated CLI environment.
 pub struct TestHarness {
     server: MockServer,
@@ -40,16 +49,36 @@ impl TestHarness {
     /// Same, but serving a different spec fixture — for shapes the real spec
     /// does not contain.
     pub async fn start_with_spec(spec_json: &str) -> Self {
+        Self::start_with_specs(spec_json, None).await
+    }
+
+    /// The real spec plus a beta document, the way ilert itself serves them.
+    pub async fn start_with_beta() -> Self {
+        Self::start_with_specs(OPENAPI_SPEC, Some(BETA_SPEC)).await
+    }
+
+    /// An environment serving a stable spec and, optionally, a beta one.
+    pub async fn start_with_specs(spec_json: &str, beta_json: Option<&str>) -> Self {
         let server = MockServer::start().await;
 
         let spec: serde_json::Value =
             serde_json::from_str(spec_json).expect("fixture spec is invalid JSON");
 
         Mock::given(method("GET"))
-            .and(path("/api-docs/openapi.json"))
+            .and(path(SPEC_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(spec))
             .mount(&server)
             .await;
+
+        if let Some(beta_json) = beta_json {
+            let beta: serde_json::Value =
+                serde_json::from_str(beta_json).expect("beta fixture spec is invalid JSON");
+            Mock::given(method("GET"))
+                .and(path(BETA_SPEC_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(beta))
+                .mount(&server)
+                .await;
+        }
 
         let config_dir = TempDir::new().expect("failed to create temp config dir");
         let cache_dir = TempDir::new().expect("failed to create temp cache dir");
@@ -178,12 +207,21 @@ impl TestHarness {
 
     /// How many times this server has been asked for the OpenAPI spec.
     pub async fn spec_request_count(&self) -> usize {
+        self.request_count(SPEC_PATH).await
+    }
+
+    /// How many times this server has been asked for the beta document.
+    pub async fn beta_spec_request_count(&self) -> usize {
+        self.request_count(BETA_SPEC_PATH).await
+    }
+
+    async fn request_count(&self, spec_path: &str) -> usize {
         self.server
             .received_requests()
             .await
             .expect("no requests recorded")
             .iter()
-            .filter(|r| r.url.path() == "/api-docs/openapi.json")
+            .filter(|r| r.url.path() == spec_path)
             .count()
     }
 

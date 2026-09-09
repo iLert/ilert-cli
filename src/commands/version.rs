@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -6,7 +7,6 @@ use colored::Colorize;
 use serde_json::Value;
 
 use crate::config::ConfigManager;
-use crate::endpoint::Endpoint;
 use crate::sanitize::terminal_text;
 
 // Cache-clock architecture
@@ -313,10 +313,9 @@ fn is_newer_semver(latest: &str, current: &str) -> bool {
 /// If so, refresh the spec cache silently.
 ///
 /// This runs on a detached background task, so it does not get to invent its own
-/// rules: the URL is resolved through [`Endpoint`] rather than concatenated, and
-/// the document comes back through [`crate::openapi::fetch_spec`], which is the
-/// one fetcher with redirects disabled, a timeout, a status check and a size
-/// cap. It also has to read and write the same per-environment cache file
+/// rules: it goes through [`crate::openapi::fetch_merged_spec`], which resolves
+/// both spec URLs through `Endpoint` rather than concatenating them and fetches
+/// them with redirects disabled, a timeout, a status check and a size cap. It also has to read and write the same per-environment cache file
 /// `openapi.rs` owns — the old fixed `openapi.json` name is the pre-per-base-url
 /// path that `save_to_cache` now deletes, so this check was reading a file that
 /// no longer exists and would have written its refresh where nothing looks.
@@ -344,33 +343,35 @@ async fn try_check_api(base_url: &str) -> Result<()> {
         return Ok(());
     }
 
-    let cached_version = read_spec_version(&spec_path).unwrap_or_default();
-    if cached_version.is_empty() {
+    // Every document the cached spec was built from, not just the API's own
+    // version: the beta document is versioned separately, so a beta-only bump
+    // — or a beta document that was unreachable last time and is answering now
+    // — would otherwise go unnoticed for the whole TTL.
+    let cached_versions = read_spec_versions(&spec_path).unwrap_or_default();
+    let Some(cached_display) = crate::openapi::spec_version_display(&cached_versions) else {
         return Ok(());
-    }
+    };
 
     // Claimed before the request, for the reason spelled out in `try_check_cli`:
     // the outer budget can drop this task mid-flight, and an interval recorded
     // only on the way back would never start.
-    write_api_check_marker(&marker, base_url, &cached_version);
+    write_api_check_marker(&marker, base_url, &cached_display);
 
-    let spec_url = Endpoint::parse(base_url)?.resolve("/api-docs/openapi.json")?;
-    let outcome = crate::openapi::fetch_spec(&spec_url).await;
+    let outcome = crate::openapi::fetch_merged_spec(base_url).await;
     let Ok(fresh_spec) = outcome else {
         return outcome.map(|_| ());
     };
-    let fresh_version = fresh_spec
-        .get("info")
-        .and_then(|i| i.get("version"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let fresh_versions = crate::openapi::spec_versions(&fresh_spec);
+    let fresh_display = crate::openapi::spec_version_display(&fresh_versions);
 
-    write_api_check_marker(&marker, base_url, fresh_version);
+    write_api_check_marker(&marker, base_url, fresh_display.as_deref().unwrap_or(""));
 
-    if !fresh_version.is_empty() && fresh_version != cached_version {
+    if let Some(fresh_display) = fresh_display
+        && fresh_versions != cached_versions
+    {
         crate::openapi::save_to_cache(&spec_path, &fresh_spec)?;
 
-        eprintln!("{}", api_update_notice(&cached_version, fresh_version));
+        eprintln!("{}", api_update_notice(&cached_display, &fresh_display));
     }
 
     Ok(())
@@ -430,8 +431,8 @@ pub(crate) fn api_check_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Both versions are `info.version` out of an OpenAPI document — one fetched
-/// just now, one read back from a previous fetch. This notice can interleave
+/// Both versions name the OpenAPI documents the spec was built from — one
+/// fetched just now, one read back from a previous fetch. This notice can interleave
 /// with any command's output, since it comes from a detached task spawned in
 /// `cli.rs`.
 fn api_update_notice(cached: &str, fresh: &str) -> String {
@@ -443,14 +444,11 @@ fn api_update_notice(cached: &str, fresh: &str) -> String {
     )
 }
 
-/// Read info.version from a cached OpenAPI spec file.
-fn read_spec_version(path: &PathBuf) -> Option<String> {
+/// Read the version of each document a cached OpenAPI spec was built from.
+fn read_spec_versions(path: &PathBuf) -> Option<BTreeMap<String, String>> {
     let content = std::fs::read_to_string(path).ok()?;
     let spec: Value = serde_json::from_str(&content).ok()?;
-    spec.get("info")
-        .and_then(|i| i.get("version"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    Some(crate::openapi::spec_versions(&spec))
 }
 
 /// `info.version` of the spec cached for this environment, for display.
@@ -625,7 +623,8 @@ mod tests {
         )
         .expect("write");
 
-        let read = read_spec_version(&path).expect("a version is present");
+        let versions = read_spec_versions(&path).expect("the spec parses");
+        let read = crate::openapi::spec_version_display(&versions).expect("a version is present");
         assert!(read.contains('\u{1b}'), "the fixture has to be hostile");
 
         let rendered = format!("{}   {}", "api".dimmed(), terminal_text(&read).cyan());
