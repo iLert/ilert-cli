@@ -75,13 +75,13 @@ per rule. The count of alert sources is a migration decision, not a translation.
 
 | Opsgenie | ilert | Notes                                                                                                                                     |
 | --- | --- |-------------------------------------------------------------------------------------------------------------------------------------------|
-| Integration | Alert Source | Carries `escalationPolicy`, `integrationKey`, `integrationUrl`                                                                            |
+| Integration | Alert Source | Carries `escalationPolicy` — **required**, so an integration with no `ownerTeam` (hence no routing rule and no escalation) needs one decided for it — plus `integrationKey`, `integrationUrl`                                                                            |
 | API key / integration key | Alert Source `integrationKey` | New value; every emitter must be re-pointed                                                                                               |
 | Team | Team | Visibility and ownership; carries no routing rules, but can be an escalation rule target                                                  |
 | Team routing rule | Event Flow, or Escalation Policy `routingKey` | No single equivalent, but an Event Flow covers nearly all of it — see above                                                               |
 | Escalation | Escalation Policy | Rules hold `escalationTimeout` plus `users` / `schedules` / `teams`                                                                       |
-| Schedule | Schedule | `type` is `STATIC` or `RECURRING`                                                                                                         |
-| Rotation | `scheduleLayers` | On `RECURRING` schedules                                                                                                                  |
+| Schedule | Schedule | `type` is `STATIC` or `RECURRING`; `RECURRING` needs at least one layer. No enabled/disabled flag — a disabled Opsgenie schedule goes **live** on import                                                                                                         |
+| Rotation | `scheduleLayers`, one ilert schedule **per rotation** | Rotations are concurrent, layers are not — see below                                                                                                                  |
 | Override | Shift, via `PUT /schedules/{id}/overrides` | Same `Shift` payload as a schedule shift, but its own endpoint; must not be in the past                                                   |
 | Alert | Alert | `PENDING` → `ACCEPTED` → `RESOLVED`                                                                                                       |
 | Alert `alias` | Alert `alertKey` | Deduplication identity                                                                                                                    |
@@ -104,11 +104,11 @@ per rule. The count of alert sources is a migration decision, not a translation.
 | Incoming call routing | Call Flow + Call Flow Number | A whole product area, easily forgotten — see below                                                                                        |
 | Forwarding rule | Schedule override, per schedule | Narrower than Opsgenie's, and not a single object — see below                                                                             |
 | Custom user role | `Role` / `TeamRole` | Fixed enums (`ADMIN`, `USER`, `RESPONDER`, `STAKEHOLDER`, `GUEST`), (custom rbac roles require Enterprise plan)                           |
-| Team member + team role | `/teams/{id}/members` with `TeamRole` |                                                                                                                                           |
+| Team member + team role | `/teams/{id}/members` with `TeamRole` | In a public team the `TeamRole` may not rank below the user's base `Role` — take the higher of the two; `STAKEHOLDER` and `VIEWER` must match exactly                                                                                                                                           |
 | Who is on call | `/on-calls` | Not a migrated object; the endpoint to verify coverage after import                                                                       |
 | Action / outgoing webhook | Alert Action + Connector | Connector holds credentials, Alert Action the binding                                                                                     |
 | Priority P1–P5 | Alert severity, integer `1`–`5` on the event (displayed `SEV1`–`SEV5`) | One for one — see below; priority `HIGH`/`LOW` is a separate, two-valued field                                                            |
-| Escalation rule `delay.timeAmount` | Escalation rule `escalationTimeout` | Per rule on both sides; minutes on both sides                                                                                             |
+| Escalation rule `delay.timeAmount` | Escalation rule `escalationTimeout` | Minutes on both sides, but measured from a different origin — convert as a delta, see below                                                                                             |
 | Escalation `repeat` | Escalation Policy `repeating` / `frequency` | Moves from the escalation to the policy — see below                                                                                       |
 
 ## Mappings that silently change behaviour
@@ -281,6 +281,15 @@ tempts a generic ilert source. Where a dedicated `integrationType` exists for th
 emitting system, use it: field extraction, link templates and bidirectional sync
 depend on it. Alert source templates still allow customization on top of the integration defaults.
 
+**Opsgenie rotations are additive; ilert schedule layers are an override
+stack.** Every rotation in an Opsgenie schedule puts its current participant on
+call *simultaneously*. An ilert schedule resolves to **one** person — where
+layers overlap the higher layer wins — so folding a multi-rotation schedule into
+one ilert schedule silently halves the coverage. Build **one ilert schedule per
+rotation** and list them together in the escalation rule's `schedules` array,
+which takes a list. Two names from `on-calls?flat=true` must still be two names
+after import.
+
 **Escalation to an empty schedule falls through — and instantly.** An
 escalation rule pointing at a schedule with nobody on call advances to the next
 rule *without waiting for the escalation timeout*, so a policy can burn through
@@ -289,6 +298,15 @@ policy, nobody is notified at all. Import schedules and their shifts before the
 policies that reference them, then verify current coverage — a policy imported
 ahead of its schedules looks perfectly correct and pages no one. This is a feature
 that allows for chaining multiple schedules in more complex on-call scenarios.
+
+**Escalation delay is measured from a different origin.** Opsgenie's `delay` is
+time since the escalation *started* — `delay: 0` fires immediately, `delay: 10`
+at T+10. ilert's `escalationTimeout` is how long to wait *at that level* before
+moving to the next. Copying the number across gives level one a timeout of `0`,
+which burns through every level the moment the alert arrives and pages everybody
+at once. Convert as a delta, over rules sorted by `delay`:
+`ilert_timeout[n] = og_delay[n+1] - og_delay[n]`, with a chosen value for the
+last level. Opsgenie `[0, 10]` becomes ilert `[10, …]`.
 
 **Repeat behaviour lives on the policy, and only the count survives.** Opsgenie
 repeats from the escalation object; ilert uses `repeating` and `frequency` on the
@@ -358,7 +376,9 @@ Authorization: GenieKey …
 Verify it with one cheap call — `GET /v2/account` — before building anything on
 top of it. Mind the version prefixes: most resources are `/v2`, but **services
 and incidents are `/v1`**, and calling the wrong one 404s in a way that looks
-like "it isn't there".
+like "it isn't there". A plan-gated or absent collection answers the same way —
+`404`, or `402` on Free — so report it as unread rather than recording an empty
+account.
 
 | What you are migrating | Where to read it |
 | --- | --- |
@@ -375,7 +395,7 @@ like "it isn't there".
 | Notification policies | `GET /v2/policies/notification?teamId=…` — `teamId` is required, so this one is per team by definition |
 | Services | `GET /v1/services` |
 | Incidents and their rules | `GET /v1/incidents`, `GET /v1/services/{id}/incident-rules`, `GET /v1/incident-templates` |
-| Heartbeats | `GET /v2/heartbeats` |
+| Heartbeats | `GET /v2/heartbeats` — the one nested envelope: the records are at `data.heartbeats`, not `data` |
 | Maintenance | `GET /v2/maintenance?type=…` — pass the filter deliberately; the default does not give you everything |
 | Custom user roles | `GET /v2/custom-user-roles` |
 | Alert history | `GET /v2/alerts?query=…&sort=createdAt&order=asc`, then `/v2/alerts/{id}`, `/notes`, `/logs` for detail |

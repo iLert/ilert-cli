@@ -43,14 +43,14 @@ escalation policy drives.
 
 | PagerDuty | ilert | Notes |
 | --- | --- | --- |
-| Service | Alert Source | Carries `escalationPolicy`, `integrationKey`, `integrationUrl` |
-| Integration (routing key) | Alert Source `integrationKey` / `integrationUrl` | New value; every emitter must be re-pointed |
+| Service | Alert Source | Carries `escalationPolicy`, `integrationKey`, `integrationUrl`. PD `status` is not two-state: `active`, `warning`, `critical` and `maintenance` all describe a live service — only `disabled` maps to `active: false` |
+| Integration (routing key) | Alert Source `integrationKey` / `integrationUrl` | New value; every emitter must be re-pointed. A source holds **one** `integrationType` and one key, so a PD service with N integrations needs N alert sources |
 | Escalation Policy | Escalation Policy | Rules hold `escalationTimeout` plus `users` / `schedules` / `teams` |
 | Schedule | Schedule | `type` is `STATIC` or `RECURRING` |
-| Schedule layer | `scheduleLayers` | Only on `RECURRING` schedules |
+| Schedule layer | `scheduleLayers` | Only on `RECURRING` schedules; `startsOn` / `endsOn` are naive wall-clock (`2026-01-01T09:00:00`) read against the schedule's `timezone` — a trailing `Z` or an offset is rejected, so strip PD's. Shifts and overrides are the opposite and do take an offset |
 | Override | Shift, via `PUT /schedules/{id}/overrides` | Same `Shift` payload as a schedule shift, but its own endpoint; must not be in the past |
 | Team | Team | `visibility` is `PUBLIC` or `PRIVATE` — only `PRIVATE` restricts, see below |
-| User | User | |
+| User | User | `firstName` **and** `lastName` are both required; PD's single `name` may be one token, so pick a filler rather than failing the create |
 | Contact method | Contact | Separate objects per channel |
 | Notification rule | Notification Preference | Split by priority *and* by notification type |
 | Incident | Alert | |
@@ -62,7 +62,7 @@ escalation policy drives.
 | Maintenance Window | Maintenance Window | |
 | Event Orchestration / Event Rules | Event Flow | A layer above alert sources with its own ingest URL — see below |
 | Orchestration dynamic routing | Escalation Policy `routingKey` + Alert Source `routingTemplate` | Direct equivalent; usually replaces the orchestration outright — see below |
-| Extension / Webhook | Alert Action + Connector | Connector holds the credentials, Alert Action the binding |
+| Extension / Webhook | Alert Action (+ Connector) | A connector exists only for *named* integrations — `webhook` is an `AlertActionType` but **not** a `ConnectorType`, so a plain webhook is connector-less with the URL in `params.webhookUrl`. The PD event → `triggerTypes` mapping is lossy: `incident.priority_updated`, `.status_update_published` and `.responder.replied` have no equivalent — report them rather than dropping them |
 | Priority (P1–P5) | Alert severity, integer `1`–`5` on the event (displayed `SEV1`–`SEV5`) | One for one — see below |
 | Urgency (high / low) | Alert priority `HIGH` / `LOW` | Priority stays two-valued; this is the faithful mapping |
 | Response Play / Incident Workflow | Incident responders, incident channel, conference bridge — triggered by an `ilert incidents` Alert Action | The actions map, and the automatic trigger has an equivalent — see below |
@@ -215,8 +215,10 @@ the alert source's `alertCreation` mode does:
 
 `alertGroupingWindow` is consulted only by the last two. PD's
 `alert_grouping_parameters` expresses the same intent with different primitives,
-so set the mode explicitly per source — the default is `ONE_ALERT_PER_EMAIL`, an
-event-shaped answer that means "every event opens a new alert".
+so always send the mode explicitly. The spec documents a default of
+`ONE_ALERT_PER_EMAIL`, but an omitted `alertCreation` is stored as
+`ONE_OPEN_ALERT_ALLOWED` — every event folded into one open alert, which is not
+what a PD service without `alert_grouping_parameters` was doing.
 
 However, when an `alertKey` is present and matches an open alert it will be
 grouped regardless, and with a dedicated `integrationType` (not `API` — e.g.
@@ -232,7 +234,9 @@ source replaces PD's service-level auto-resolve. Absent means never.
 source that has a dedicated one loses field extraction, link templates and
 bidirectional sync. Match the emitting system's type rather than defaulting to a
 webhook. Alert source templates still allow customization on top of the
-integration defaults.
+integration defaults. An `EMAIL2` source is the one type that will not mint its
+own key: pass `integrationKey` explicitly — the local part of PD's
+`integration_email` keeps the new address traceable to the one it replaces.
 
 **Escalation to an empty schedule falls through — and instantly.** An ilert
 escalation rule pointing at a schedule with nobody on call advances to the next
@@ -343,7 +347,7 @@ anything on top of it.
 | Users, contact methods, notification rules | `GET /users?include[]=contact_methods&include[]=notification_rules` — the includes avoid an N+1 across the whole directory |
 | Teams and membership | `GET /teams`, then `GET /teams/{id}/members` — the role lives on the membership, not on the user |
 | Escalation policies | `GET /escalation_policies?include[]=targets` |
-| Schedules | `GET /schedules` lists names only; `GET /schedules/{id}` carries `schedule_layers`, and `since` / `until` render the actual entries |
+| Schedules | `GET /schedules` lists names only; `GET /schedules/{id}` carries `schedule_layers`, and `since` / `until` render the actual entries. `schedule_v3` escalation targets are absent from this collection and a `GET` on their id returns `400` — resolve every escalation target before building the policy, or it looks migrated and pages nobody |
 | Overrides | `GET /schedules/{id}/overrides?since=…&until=…` — the window is required, and only future overrides are worth recreating |
 | Alert sources | `GET /services?include[]=integrations` — one call gives you the service settings and its integrations |
 | Event Orchestrations | `GET /event_orchestrations`, `GET /event_orchestrations/{id}/router` for the global router, `GET /event_orchestrations/services/{service_id}` for the per-service one — three separate reads, and a setup can use all three |
@@ -370,6 +374,14 @@ than offset, and `total` is only returned if you ask for it with `total=true`.
 `ratelimit-limit`, `ratelimit-remaining` and `ratelimit-reset`. Pace off those
 headers rather than sleeping blindly.
 
+**A read that fails is not an empty collection.** Plan-gated collections error
+rather than return `[]` — `GET /teams` gives `402`, `GET /incident_workflows`
+`403` — and `GET /response_plays`, superseded by incident workflows, answers
+`301` with no `Location`, which crashes clients that follow redirects. A lapsed
+subscription returns a bare `401` on *every* endpoint, in both regions and under
+both `Token token=` and `Bearer`, so a `401` on `/abilities` means "bad key **or**
+dead account" — check the account state before restarting credential archaeology.
+
 **The dumps contain credentials.** A service's `integrations` carry live
 `integration_key` values — those are the keys the old emitters are still using.
 Treat the extraction files as secret material: keep them out of the repo, out of
@@ -384,7 +396,10 @@ than pasting them around.
 ## Order of migration
 
 Dependencies run one way. Build in this order so no object is created with a
-dangling reference:
+dangling reference. Consolidating several PD accounts into one ilert tenant runs
+the list once per account with a lookup-then-create pass on each object: e-mail
+addresses and alert source names are unique, so the second account must reuse the
+existing ilert user rather than create a duplicate.
 
 1. Users — with their `Role` (in theory custom RBAC roles first, if needed and in
    Enterprise plan)

@@ -21,7 +21,7 @@ the relevant one: they cover the mapping, this covers the platform.
 | **Incident** | The coordination record above alerts (used on business impact) — multi channel responders, timeline, incident channel. It publishes nothing by itself |
 | **Status update** | The public message posted *from* an incident. This is what reaches status pages and subscribers |
 | **Escalation Policy** | Ordered rules with `escalationTimeout`, targeting users, schedules or teams. Also `repeating` / `frequency`, `delayMin`, `routingKey` |
-| **Schedule** | `STATIC` or `RECURRING`; `RECURRING` carries `scheduleLayers`. Overrides go through `PUT /schedules/{id}/overrides` |
+| **Schedule** | `STATIC` or `RECURRING`; `RECURRING` carries `scheduleLayers` (at least one), and resolves to **one** person on call — where layers overlap the higher one wins. Overrides go through `PUT /schedules/{id}/overrides` |
 | **Event Flow** | A routing layer *above* alert sources with its own ingest URL. Nodes: `ROOT`, `DEFINE_BRANCHES`, `ROUTE_EVENT`, `SUPPORT_HOURS`, `WAIT`, `TRANSFORM` |
 | **Call Flow** | The same idea for inbound phone calls: `IVR_MENU`, `AUDIO_MESSAGE`, `SUPPORT_HOURS`, `ROUTE_CALL`, `PARALLEL_ROUTE_CALL`, `VOICEMAIL`, `PIN_CODE`, `CREATE_ALERT`, `BLOCK_NUMBERS`, `AGENTIC` |
 | **Alert Action + Connector** | Outbound automation. The Connector holds credentials, the Alert Action binds it to a source with `triggerMode`, `triggerTypes` and ICL `conditions` |
