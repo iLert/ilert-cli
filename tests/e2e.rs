@@ -159,6 +159,157 @@ async fn auth_whoami_table_shows_the_user_not_a_nested_list() {
         );
 }
 
+/// The account fields land on the same record as the user, so one `--jq` or
+/// `--fields` reaches both, and the tenant is named `tenantId` rather than the
+/// account's own `id`, which the user already occupies.
+#[tokio::test]
+async fn whoami_reports_the_account_alongside_the_user() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "username": "testuser",
+            "email": "test@ilert.com"
+        })))
+        .mount(h.server())
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tenants/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "acct-42",
+            "organizationName": "ACME GmbH",
+            "timezone": "Europe/Berlin",
+            "subscription": {"name": "Premium", "status": "ACTIVE"}
+        })))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args(["auth", "whoami", "--api-key", "my-api-key", "-o", "json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(r#""tenantId": "acct-42""#)
+                .and(predicate::str::contains(
+                    r#""organizationName": "ACME GmbH""#,
+                ))
+                .and(predicate::str::contains(r#""subscriptionPlan": "Premium""#))
+                .and(predicate::str::contains(
+                    r#""subscriptionStatus": "ACTIVE""#,
+                ))
+                // The user is still the record being reported on, and the
+                // account's own id never displaces theirs.
+                .and(predicate::str::contains(r#""id": 1"#))
+                .and(predicate::str::contains("testuser"))
+                // Only the four fields worth having on an identity check come
+                // across; the rest of the account is not whoami's business.
+                .and(predicate::str::contains("Europe/Berlin").not()),
+        );
+}
+
+/// The account endpoint is younger than the user one, so an older or
+/// self-hosted ilert answers 404 — and a narrowly scoped token gets a 403.
+/// Neither is a failed `whoami`: the user still prints and the exit status
+/// stays 0.
+#[tokio::test]
+async fn whoami_survives_an_account_endpoint_that_is_not_there() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "username": "testuser"
+        })))
+        .mount(h.server())
+        .await;
+
+    // No mock for /api/tenants/current at all — the deployment does not serve it.
+    h.cmd()
+        .args(["auth", "whoami", "--api-key", "my-api-key", "-o", "json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("testuser")
+                .and(predicate::str::contains("tenantId").not())
+                .and(predicate::str::contains("subscriptionPlan").not()),
+        )
+        // A missing account is the normal case on an older API, so it must not
+        // nag on every run.
+        .stderr(predicate::str::contains("account details omitted").not());
+}
+
+/// An account may have no plan and no organization name. Those fields are
+/// omitted rather than reported empty, and the tenant still comes across.
+#[tokio::test]
+async fn whoami_omits_account_fields_the_account_does_not_have() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": 1, "username": "testuser"})),
+        )
+        .mount(h.server())
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tenants/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "acct-42"})))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args(["auth", "whoami", "--api-key", "my-api-key", "-o", "json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(r#""tenantId": "acct-42""#)
+                .and(predicate::str::contains("organizationName").not())
+                .and(predicate::str::contains("subscriptionPlan").not())
+                .and(predicate::str::contains("subscriptionStatus").not()),
+        );
+}
+
+/// `ilert whoami` is `ilert auth whoami` — one implementation under two
+/// spellings, so the shorthand reports the account too.
+#[tokio::test]
+async fn whoami_works_without_the_auth_prefix() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/users/current"))
+        .and(bearer_token("my-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "username": "testuser"
+        })))
+        .mount(h.server())
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tenants/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "acct-42",
+            "subscription": {"name": "Premium", "status": "TRIAL"}
+        })))
+        .mount(h.server())
+        .await;
+
+    h.cmd()
+        .args(["whoami", "--api-key", "my-api-key", "-o", "json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("testuser")
+                .and(predicate::str::contains(r#""tenantId": "acct-42""#))
+                .and(predicate::str::contains(r#""subscriptionStatus": "TRIAL""#)),
+        );
+}
+
 #[tokio::test]
 async fn auth_logout_removes_key() {
     let h = TestHarness::start().await;

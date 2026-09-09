@@ -320,6 +320,9 @@ pub fn for_operation(method: &str, operation_id: &str, op_value: &Value) -> Resu
 pub const STATIC_COMMANDS: &[(&str, Classification)] = &[
     // Read-only.
     ("auth whoami", Classification::new(true, false, true)),
+    // The top-level shorthand for `auth whoami`, and read-only for the same
+    // reason: two GETs against `/current` endpoints.
+    ("whoami", Classification::new(true, false, true)),
     ("auth show", Classification::new(true, false, true)),
     ("config list", Classification::new(true, false, true)),
     ("config show", Classification::new(true, false, true)),

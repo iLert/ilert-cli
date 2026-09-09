@@ -193,6 +193,7 @@ fn clear_cache() -> Result<Vec<String>> {
 /// Names reserved for static subcommands — dynamic tags must not collide.
 const STATIC_COMMANDS: &[&str] = &[
     "auth",
+    "whoami",
     "config",
     "completions",
     "ops",
@@ -359,6 +360,8 @@ impl Cli {
     ) -> Result<()> {
         match matches.subcommand() {
             Some(("auth", sub)) => self.handle_auth(sub, config, ctx).await,
+            // The shorthand: `ilert whoami` is `ilert auth whoami`.
+            Some(("whoami", _)) => self.handle_whoami(config, ctx).await,
             Some(("config", sub)) => self.handle_config(sub, config, ctx).await,
             Some(("completions", sub)) => self.handle_completions(sub, ctx),
             Some(("ops", sub)) => self.handle_ops(sub, config, ctx).await,
@@ -605,13 +608,7 @@ impl Cli {
                 ));
                 Ok(())
             }
-            Some(("whoami", _)) => {
-                let client = self.make_client(config, true, ctx).await?;
-                let (_, user) = client
-                    .request(reqwest::Method::GET, "/api/users/current", &[], &[], None)
-                    .await?;
-                ctx.print_response(&user)
-            }
+            Some(("whoami", _)) => self.handle_whoami(config, ctx).await,
             Some(("show", _)) => {
                 // Build a flat object so it renders cleanly in table output
                 // (nested objects collapse to "{...}" in the table view).
@@ -704,6 +701,52 @@ impl Cli {
                 Ok(())
             }
         }
+    }
+
+    /// `auth whoami`, and the top-level `ilert whoami` that dispatches straight
+    /// here — one implementation, so the shorthand can never drift from the
+    /// long form.
+    ///
+    /// The user is the answer; the account is context on top of it. Both hang
+    /// off `/current` endpoints, so neither takes an argument, and the account
+    /// fields worth having on an identity check — which tenant this is, whose
+    /// organization, which plan and whether that plan is in good standing — are
+    /// merged into the same record instead of printed as a second table. One
+    /// record is also what `--jq` and `--fields` can address.
+    ///
+    /// The account call is best effort, and the whole reason `whoami` is not
+    /// simply two requests joined with `?`. `/api/tenants/current` is younger
+    /// than the user endpoint, so an older or self-hosted ilert answers 404 —
+    /// a deployment that does not publish account details, not a failed
+    /// `whoami` — and a narrowly scoped token lands in the same place with a
+    /// 403. Either way the user still prints and the exit status stays 0; the
+    /// reason goes out at debug level, because a warning on every run against
+    /// an older API is noise the caller cannot act on.
+    async fn handle_whoami(&self, config: &ResolvedConfig, ctx: &RunContext) -> Result<()> {
+        let client = self.make_client(config, true, ctx).await?;
+        let (_, user) = client
+            .request(reqwest::Method::GET, "/api/users/current", &[], &[], None)
+            .await?;
+
+        // Nothing to merge into if the user is not an object. Printing the body
+        // as it arrived beats inventing a wrapper for it.
+        let Some(user_fields) = user.value().as_object() else {
+            return ctx.print_response(&user);
+        };
+        let mut merged = user_fields.clone();
+
+        match client
+            .request(reqwest::Method::GET, "/api/tenants/current", &[], &[], None)
+            .await
+        {
+            Ok((_, account)) => merge_account_fields(&mut merged, account.value()),
+            Err(e) => ctx.debug(&format!(
+                "account details omitted: {}",
+                crate::sanitize::terminal_string(e.to_string())
+            )),
+        }
+
+        ctx.print(&serde_json::Value::Object(merged))
     }
 
     // -- Config commands --
@@ -1747,6 +1790,7 @@ fn build_command(index: &Option<OperationIndex>, base_url: &str) -> Command {
         )
         // Static subcommands
         .subcommand(build_auth_command())
+        .subcommand(build_whoami_command())
         .subcommand(build_config_command())
         .subcommand(build_completions_command())
         .subcommand(build_ops_command())
@@ -2028,6 +2072,61 @@ fn param_value_name(param: &crate::openapi::Parameter) -> String {
 // Static subcommand builders
 // ---------------------------------------------------------------------------
 
+/// Lift the account fields `whoami` reports onto the user record.
+///
+/// Named from the caller's side rather than the account's: the account calls
+/// its own identifier `id`, which is already taken on a user, and `tenantId` is
+/// what the reader is looking for anyway. The plan is flattened out of
+/// `subscription` for the same reason `auth show` is flat — a nested object
+/// renders as `{...}` in the table view, which tells nobody anything.
+///
+/// Every field is optional and absence is the normal case, not an error: an
+/// account may have no organization name, a deployment may not bill at all, and
+/// the whole object may be missing because the endpoint was refused. A key the
+/// user already carries is never overwritten — the user is what was asked for.
+fn merge_account_fields(
+    user: &mut serde_json::Map<String, serde_json::Value>,
+    account: &serde_json::Value,
+) {
+    let Some(account) = account.as_object() else {
+        return;
+    };
+    let subscription = account
+        .get("subscription")
+        .and_then(serde_json::Value::as_object);
+
+    let fields = [
+        ("tenantId", account.get("id")),
+        ("organizationName", account.get("organizationName")),
+        ("subscriptionPlan", subscription.and_then(|s| s.get("name"))),
+        (
+            "subscriptionStatus",
+            subscription.and_then(|s| s.get("status")),
+        ),
+    ];
+
+    for (key, value) in fields {
+        if let Some(value) = value.filter(|v| !v.is_null())
+            && !user.contains_key(key)
+        {
+            user.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+/// The top-level shorthand for `auth whoami`.
+///
+/// A separate command rather than a clap alias, because an alias renames a
+/// subcommand where it already sits — it cannot lift `whoami` out of `auth` to
+/// the root. Both names reach [`Cli::handle_whoami`], so there is one behavior
+/// under two spellings, and "whoami" is reserved in [`STATIC_COMMANDS`] so a
+/// tag from the spec can never shadow it.
+fn build_whoami_command() -> Command {
+    Command::new("whoami")
+        .about("Show current user and account info")
+        .after_help("Shorthand for 'ilert auth whoami' — the same output, fewer words.")
+}
+
 fn build_auth_command() -> Command {
     Command::new("auth")
         .about("Manage authentication")
@@ -2037,7 +2136,7 @@ fn build_auth_command() -> Command {
             ilert auth login                          Log in via your browser (OAuth)\n  \
             ilert auth login --api-key il1api...      Log in with an API key\n  \
             echo $KEY | ilert auth login --with-token  Headless API-key login (stdin)\n  \
-            ilert auth whoami                          Check who you are\n  \
+            ilert auth whoami                          Check who you are (or just: ilert whoami)\n  \
             ilert auth show                            Show current auth (secrets masked)\n\n\
             No browser available (e.g. over SSH)? Use --with-token or set ILERT_API_KEY.\n\n\
             Another ilert environment? Give it its own profile — the endpoint and the\n\
@@ -2066,7 +2165,7 @@ fn build_auth_command() -> Command {
                 ),
         )
         .subcommand(Command::new("logout").about("Remove stored credentials"))
-        .subcommand(Command::new("whoami").about("Show current user info"))
+        .subcommand(Command::new("whoami").about("Show current user and account info"))
         .subcommand(Command::new("show").about("Show current auth config"))
 }
 
