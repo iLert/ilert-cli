@@ -2297,6 +2297,15 @@ mod tests {
                     ),
                     schema: Some(serde_json::json!({"type": "array", "items": {"type": "string"}})),
                 },
+                // A single-valued query parameter, to hold the line that
+                // splitting follows the schema rather than the comma.
+                Parameter {
+                    name: "query".into(),
+                    location: ParamLocation::Query,
+                    required: false,
+                    description: None,
+                    schema: Some(serde_json::json!({"type": "string"})),
+                },
             ],
             request_body_schema: None,
             has_request_body: false,
@@ -2352,12 +2361,71 @@ mod tests {
         );
     }
 
-    /// The form that already worked keeps working: the value is passed through
-    /// as given rather than split, so nothing that relied on it changes.
+    /// `--include a,b` was sent as the single value "a,b". The server matches
+    /// each `include` it receives against a fixed set and ignores anything else,
+    /// so a read asking for two of them got neither: `"scheduleLayers": []` and
+    /// `"currentShift": null`, indistinguishable from a schedule that has
+    /// neither. The comma is the caller writing a list; send it as one.
     #[test]
-    fn a_comma_joined_list_is_still_sent_as_one_value() {
+    fn a_comma_joined_list_is_expanded_into_one_pair_per_value() {
         let query = query_for(&["get", "--id", "1", "--include", "a,b"]).expect("parses");
-        assert_eq!(query, vec![("include".to_string(), "a,b".to_string())]);
+        assert_eq!(
+            query,
+            vec![
+                ("include".to_string(), "a".to_string()),
+                ("include".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    /// Spacing and stray separators are the caller's typing, not values: an
+    /// empty `include=` would be one more thing the server silently ignores.
+    #[test]
+    fn expanding_a_list_drops_blank_elements_and_surrounding_space() {
+        let query = query_for(&["get", "--id", "1", "--include", " a, ,b ,"]).expect("parses");
+        assert_eq!(
+            query,
+            vec![
+                ("include".to_string(), "a".to_string()),
+                ("include".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    /// Mixing the two forms is the shape a script ends up with when it appends
+    /// one flag per source and one of the sources already held a list.
+    #[test]
+    fn repeated_and_comma_joined_flags_combine() {
+        let query = query_for(&[
+            "get",
+            "--id",
+            "1",
+            "--include",
+            "scheduleLayers,currentShift",
+            "--include",
+            "nextShift",
+        ])
+        .expect("parses");
+        assert_eq!(
+            query,
+            vec![
+                ("include".to_string(), "scheduleLayers".to_string()),
+                ("include".to_string(), "currentShift".to_string()),
+                ("include".to_string(), "nextShift".to_string()),
+            ]
+        );
+    }
+
+    /// Splitting is a property of the *array* schema, not of the comma. A
+    /// single-valued parameter carries the caller's text verbatim — a search
+    /// term is not a list because it happens to contain a separator.
+    #[test]
+    fn a_single_valued_parameter_keeps_its_commas() {
+        let query = query_for(&["get", "--id", "1", "--query", "eu, primary"]).expect("parses");
+        assert_eq!(
+            query,
+            vec![("query".to_string(), "eu, primary".to_string())]
+        );
     }
 
     #[test]

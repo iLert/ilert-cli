@@ -356,6 +356,11 @@ impl RequestParams {
                 },
                 ParamLocation::Query => {
                     let values = with_spec_default(param, values);
+                    let values = if param.is_list() {
+                        expand_comma_joined(values)
+                    } else {
+                        values
+                    };
                     if values.is_empty() && param.required {
                         return Err(missing_parameter(operation, param, "query").into());
                     }
@@ -430,6 +435,38 @@ fn with_spec_default(param: &Parameter, values: Vec<String>) -> Vec<String> {
         return values;
     }
     param.default_value().into_iter().collect()
+}
+
+/// A list parameter's values, with any comma-joined one expanded into the
+/// elements the caller meant.
+///
+/// `--include a,b` looks like every other CLI's list syntax, and it is the form
+/// a spec description that says "You may declare multiple" invites. But the
+/// spec declares these parameters `style: form, explode: true`: one pair per
+/// element, and the server compares each value it receives to a fixed set. So
+/// `include=scheduleLayers,currentShift` arrives as a single unrecognised value
+/// — and an unrecognised `include` is *ignored*, not rejected. The read comes
+/// back `"scheduleLayers": []` and `"currentShift": null`, which is exactly what
+/// a schedule with neither looks like.
+///
+/// Silent is the whole problem: the caller gets a well-formed 200 describing a
+/// schedule that does not exist, and nothing on stderr says a value was
+/// dropped. It reads as data loss, which is how it was reported — from a
+/// migration, as layers that had round-tripped away.
+///
+/// Splitting is safe because no array parameter in the spec has a value a comma
+/// can appear inside — they are enums and numeric IDs — and `form`/`explode`
+/// offers no way to escape one regardless, so a comma can only be the caller
+/// writing a list. Blank elements are dropped, which turns `--include a,,b` and
+/// `--include 'a, b'` into the same two pairs rather than sending an empty one.
+fn expand_comma_joined(values: Vec<String>) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|element| !element.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn missing_parameter(operation: &Operation, param: &Parameter, location: &str) -> CliError {

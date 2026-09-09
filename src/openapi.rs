@@ -1018,7 +1018,7 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
                 .to_string();
 
             let tag_normalized = normalize_tag(&tag);
-            let action = derive_action(method, path);
+            let action = derive_action(method, path, op_value, spec);
 
             let beta = op_value.get(SPEC_ORIGIN_KEY).and_then(|v| v.as_str()) == Some(BETA_ORIGIN);
             // Settled before the operation is classified, not after: a beta
@@ -1077,13 +1077,27 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
 
     // Settle the command names within each tag.
     for ops in by_tag.values_mut() {
-        // Stable operations first, so the un-suffixed name — `list`, `get` —
-        // goes to the one that already had it. Names are claimed in the order
-        // walked here, and `paths` iterates in sorted key order, so without
-        // this a purely additive beta document could rename an existing command
-        // by sorting ahead of it. A stable sort, so the order within each half
-        // is still the spec's own.
-        ops.sort_by_key(|op| op.beta);
+        // Two keys, in this order.
+        //
+        // Stable before beta, so the un-suffixed name — `list`, `get` — goes to
+        // the one that already had it. Names are claimed in the order walked
+        // here, and `paths` iterates in sorted key order, so without this a
+        // purely additive beta document could rename an existing command by
+        // sorting ahead of it.
+        //
+        // Then shallowest path first, so the resource itself outranks a lookup
+        // hung off it. `/schedules/{id}` and `/schedules/name/{name}` both
+        // derive the action `get` — one path ending in a parameter is
+        // indistinguishable from another — and sorted key order hands it to
+        // `name`, because 'n' < '{'. That renamed the canonical read of twenty
+        // resources to `get-<tag>` and gave `get` to a lookup the spec marks
+        // NON-PUBLIC, so `ilert schedules get --id 1` became a usage error the
+        // moment the spec grew the by-name endpoints. Depth is what separates
+        // them: `/schedules/{id}` is the schedule, `/schedules/name/{name}` is
+        // one way to find it, and it lands on `get-name`.
+        //
+        // A stable sort, so operations that tie are still in the spec's order.
+        ops.sort_by_key(|op| (op.beta, path_depth(&op.path)));
 
         let mut claimed: HashSet<String> = HashSet::new();
         for op in ops.iter_mut() {
@@ -1106,13 +1120,20 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
     Ok(OperationIndex { by_id, by_tag })
 }
 
-fn derive_action(method: &str, path: &str) -> String {
+fn derive_action(method: &str, path: &str, op: &Value, spec: &Value) -> String {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let ends_with_param = segments
         .last()
         .is_some_and(|s| s.starts_with('{') && s.ends_with('}'));
 
-    match (method, ends_with_param) {
+    // A trailing `{param}` usually names *which* resource, so a GET on it is a
+    // `get`. Usually — `{filterType}` in `/saved-filters/{filterType}` selects a
+    // collection, not a member, and that GET is the list. The path cannot say
+    // which kind of parameter it ends with, but the response can: a `get`
+    // answers with the resource, a `list` answers with an array of them.
+    let reads_a_collection = method == "get" && returns_an_array(op, spec);
+
+    match (method, ends_with_param && !reads_a_collection) {
         ("get", false) => "list".to_string(),
         ("get", true) => "get".to_string(),
         ("post", _) => "create".to_string(),
@@ -1121,6 +1142,34 @@ fn derive_action(method: &str, path: &str) -> String {
         ("delete", _) => "delete".to_string(),
         _ => method.to_string(),
     }
+}
+
+/// Whether an operation's success response is a JSON array.
+///
+/// Only the declared `200` body is consulted, and a `$ref` is followed once, so
+/// this reads a list response whether the document inlines the array or names
+/// it. Anything it cannot see — no schema, a `$ref` that goes nowhere — is not
+/// an array, which leaves the path shape to decide as it did before.
+fn returns_an_array(op: &Value, spec: &Value) -> bool {
+    let Some(schema) = op
+        .get("responses")
+        .and_then(|responses| responses.get("200"))
+        .and_then(|ok| ok.get("content"))
+        .and_then(|content| content.get("application/json"))
+        .and_then(|json| json.get("schema"))
+    else {
+        return false;
+    };
+
+    let resolved = match schema.get("$ref").and_then(|r| r.as_str()) {
+        Some(ref_path) => match follow_ref(ref_path, spec) {
+            Some(target) => target,
+            None => return false,
+        },
+        None => schema,
+    };
+
+    resolved.get("type").and_then(|t| t.as_str()) == Some("array")
 }
 
 /// A spec `tag` as the CLI names it: a command, an index key and a line of
@@ -1198,6 +1247,18 @@ fn claim_beta_operation_id(id: String, claimed: &mut HashSet<String>) -> String 
         }
     }
     unreachable!("the numbered candidates never run out")
+}
+
+/// How many segments deep a path is, parameters counted like any other.
+///
+/// The tiebreaker for which operation in a tag gets the plain action name. It
+/// reads as "closer to the resource wins", which is the whole rule: nothing
+/// about an endpoint marks it as the canonical one, but the canonical one is
+/// always the shortest path that names the resource.
+fn path_depth(path: &str) -> usize {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
 }
 
 /// The command name an operation gets inside its tag: its action, or — when
@@ -1824,6 +1885,138 @@ mod tests {
             assert_eq!(
                 index.by_id["get-reports-incidents"].action,
                 "list-incidents"
+            );
+        }
+
+        /// The reported bug. A path ending in a parameter is a `get` whichever
+        /// parameter it is, so `/schedules/{id}` and `/schedules/name/{name}`
+        /// both wanted `get` — and sorted path order gave it to `name`, because
+        /// 'n' sorts before '{'. Twenty resources had their canonical read
+        /// renamed to `get-<tag>` the day the spec grew its by-name lookups, so
+        /// `ilert schedules get --id 1` answered "unexpected argument '--id'".
+        #[test]
+        fn the_resource_path_outranks_a_lookup_hung_off_it() {
+            let spec = json!({
+                "paths": {
+                    "/schedules": {"get": {"tags": ["Schedules"], "summary": "List"}},
+                    "/schedules/name/{name}": {
+                        "get": {"tags": ["Schedules"], "summary": "By name"}
+                    },
+                    "/schedules/{id}": {"get": {"tags": ["Schedules"], "summary": "By id"}}
+                }
+            });
+
+            let index = build_index(&spec).expect("indexes");
+            assert_eq!(index.by_id["get-schedules-id"].action, "get");
+            assert_eq!(index.by_id["get-schedules-name-name"].action, "get-name");
+            assert_eq!(index.by_id["get-schedules"].action, "list");
+        }
+
+        /// `{filterType}` selects a collection, not a member, so
+        /// `/saved-filters/{filterType}` is the list — but the path cannot say
+        /// that, and the trailing parameter made it a `get`. It then outranked
+        /// `/{filterType}/{id}` on depth, so the read of a single filter was
+        /// called `get-saved-filters` and the list was called `get`. The
+        /// response shape is what tells them apart.
+        #[test]
+        fn a_get_that_answers_with_an_array_is_a_list() {
+            let object = json!({"200": {"content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/Filter"}
+            }}}});
+            let array = json!({"200": {"content": {"application/json": {
+                "schema": {"type": "array", "items": {"$ref": "#/components/schemas/Filter"}}
+            }}}});
+            let spec = json!({
+                "paths": {
+                    "/saved-filters/{filterType}": {
+                        "get": {"tags": ["Saved Filters"], "responses": array}
+                    },
+                    "/saved-filters/{filterType}/{id}": {
+                        "get": {"tags": ["Saved Filters"], "responses": object}
+                    }
+                },
+                "components": {"schemas": {"Filter": {"type": "object"}}}
+            });
+
+            let index = build_index(&spec).expect("indexes");
+            assert_eq!(index.by_id["get-saved-filters-filterType"].action, "list");
+            assert_eq!(index.by_id["get-saved-filters-filterType-id"].action, "get");
+        }
+
+        /// The array may be named rather than inlined, so the `$ref` is followed
+        /// once. A document that describes its list response as a component is
+        /// making the same statement as one that spells it out.
+        #[test]
+        fn a_named_array_response_reads_as_a_list_too() {
+            let spec = json!({
+                "paths": {"/filters/{filterType}": {"get": {
+                    "tags": ["Filters"],
+                    "responses": {"200": {"content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/FilterList"}
+                    }}}}
+                }}},
+                "components": {"schemas": {
+                    "FilterList": {"type": "array", "items": {"type": "object"}}
+                }}
+            });
+
+            let index = build_index(&spec).expect("indexes");
+            assert_eq!(index.by_id["get-filters-filterType"].action, "list");
+        }
+
+        /// The rule reads the response, not the method: an operation the
+        /// document says nothing about stays whatever its path shape made it,
+        /// so a spec without response schemas names its commands as before.
+        #[test]
+        fn an_undescribed_response_leaves_the_path_shape_deciding() {
+            let spec = json!({
+                "paths": {
+                    "/teams": {"get": {"tags": ["Teams"], "summary": "List"}},
+                    "/teams/{id}": {"get": {"tags": ["Teams"], "summary": "Read"}}
+                }
+            });
+
+            let index = build_index(&spec).expect("indexes");
+            assert_eq!(index.by_id["get-teams"].action, "list");
+            assert_eq!(index.by_id["get-teams-id"].action, "get");
+        }
+
+        /// Depth is the *second* key. Both of these derive `get`, and the beta
+        /// one is the shallower — but a beta document must never rename a
+        /// stable command, so the stable operation still takes the bare name.
+        #[test]
+        fn a_shorter_beta_path_still_does_not_outrank_a_stable_command() {
+            let stable = json!({
+                "paths": {
+                    "/teams/{id}/members/{memberId}": {
+                        "get": {"tags": ["Teams"], "summary": "Stable read"}
+                    }
+                }
+            });
+            let beta = json!({
+                "paths": {"/teams/{id}": {"get": {"tags": ["Teams"], "summary": "Beta read"}}}
+            });
+
+            let index =
+                build_index(&super::super::merge_specs(stable, Some(beta))).expect("indexes");
+            let named = |action: &str| {
+                index.by_tag["teams"]
+                    .iter()
+                    .find(|op| op.action == action)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "nothing is called `{action}` in {:?}",
+                            index.by_tag["teams"]
+                                .iter()
+                                .map(|op| &op.action)
+                                .collect::<Vec<_>>()
+                        )
+                    })
+            };
+            assert_eq!(named("get").path, "/teams/{id}/members/{memberId}");
+            assert!(
+                named("get-teams").beta,
+                "the beta operation is the other one"
             );
         }
     }
