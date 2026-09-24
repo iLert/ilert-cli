@@ -7,6 +7,11 @@
       "path": "ilert-essentials/SKILL.md"
     },
     {
+      "name": "ilert-terraform",
+      "description": "Use the ilert Terraform provider and export existing resources as HCL and import blocks when the user requests Terraform work",
+      "path": "ilert-terraform/SKILL.md"
+    },
+    {
       "name": "migrate-from-opsgenie",
       "description": "Map Opsgenie resources onto ilert equivalents",
       "path": "migrate-from-opsgenie/SKILL.md"

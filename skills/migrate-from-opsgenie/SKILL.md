@@ -511,6 +511,5 @@ and noisy in the old one. Migrate heartbeat monitors and their senders together.
 
 ## A word on IaC
 
-A migration might be the right choice to introduce IaC along the way for most resources.
-If that is a desired choice ilert offers an official Terraform provider https://registry.terraform.io/providers/iLert/ilert/
-To which the same rules mentioned in this file may be applied.
+If the user requests Terraform as part of the migration, read
+`ilert skills show ilert-terraform` for provider setup and export/import guidance.
