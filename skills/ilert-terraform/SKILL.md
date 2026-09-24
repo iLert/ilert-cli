@@ -1,6 +1,6 @@
 ---
 name: ilert-terraform
-description: Use the ilert Terraform provider and export existing resources as HCL and import blocks when the user requests Terraform work.
+description: Use the ilert Terraform provider and export existing resources as HCL and import blocks when the user requests Terraform work
 user-invocable: true
 ---
 
