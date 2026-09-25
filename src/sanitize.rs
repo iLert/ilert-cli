@@ -80,6 +80,22 @@ pub fn terminal_text(s: &str) -> String {
     out
 }
 
+/// [`terminal_text`] for prose whose line breaks are its layout: `--help`
+/// descriptions, where a numbered list or a table collapsed onto one line with
+/// literal `\n`s in it is unreadable.
+///
+/// Only `\n` survives, and a `\r\n` pair is read as one. The forged-line
+/// attack needs `\r` to overwrite what is already on the line; a newline on
+/// its own can only add a line, which is what the text is doing anyway.
+/// Everything else is escaped exactly as [`terminal_text`] does.
+pub fn terminal_multiline(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .split('\n')
+        .map(terminal_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// [`terminal_text`] for an owned string, avoiding the copy when there is
 /// nothing to escape.
 pub fn terminal_string(s: String) -> String {
@@ -203,6 +219,16 @@ mod tests {
     fn escaping_is_idempotent() {
         let once = terminal_text("\u{1b}[2Ja\nb");
         assert_eq!(terminal_text(&once), once);
+    }
+
+    #[test]
+    fn multiline_keeps_line_breaks_and_nothing_else() {
+        assert_eq!(terminal_multiline("1. Fetch\n2. Post"), "1. Fetch\n2. Post");
+        assert_eq!(terminal_multiline("a\r\nb"), "a\nb");
+        assert_eq!(terminal_multiline("ok\rError: none"), "ok\\rError: none");
+        assert_eq!(terminal_multiline("a\tb\n\u{1b}[2J"), "a\\tb\n\\u{001B}[2J");
+        assert_eq!(terminal_multiline("\u{202E}x\ny"), "\\u{202E}x\ny");
+        assert_eq!(terminal_multiline("plain"), "plain");
     }
 
     #[test]

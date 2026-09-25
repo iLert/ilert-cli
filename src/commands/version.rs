@@ -65,7 +65,7 @@ pub fn current_version() -> &'static str {
 /// everyone who never asked.
 pub fn handle(ctx: &crate::cli::RunContext, base_url: &str) -> Result<()> {
     if !ctx.format_requested && ctx.jq.is_none() && ctx.fields.is_none() {
-        println!("{}", version_block(base_url));
+        crate::outln!("{}", version_block(base_url));
         return Ok(());
     }
 

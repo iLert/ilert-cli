@@ -8,6 +8,56 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::sanitize::terminal_text;
 
+/// `println!` that does not panic when stdout goes away.
+///
+/// `println!` panics on any write error, and the everyday one is a closed pipe:
+/// `ilert alerts list | head -1` hangs up after one line, and the next write
+/// used to end in a panic trace and exit 101. A reader that stopped reading
+/// has everything it asked for, so that ends the process quietly and
+/// successfully, the way `rg` does. Anything else (a full disk behind a
+/// redirect) is still an error, and is reported as one.
+///
+/// Restoring the default `SIGPIPE` disposition would also silence this, but
+/// it applies to every socket in the process as well, and a peer resetting an
+/// HTTP connection must stay an error the request can report, not a kill.
+///
+/// There is deliberately no `print!` counterpart. Stdout is line-buffered, so
+/// text without a trailing newline is not written until a later flush, and
+/// that flush is where the error would surface, outside this handling (at
+/// exit, not at all). Output that may not end in a newline goes through
+/// [`write_stdout_bytes`], which writes and flushes in one handled step.
+#[macro_export]
+macro_rules! outln {
+    () => {
+        $crate::output::write_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+pub fn write_stdout(args: std::fmt::Arguments<'_>) {
+    if let Err(e) = io::stdout().lock().write_fmt(args) {
+        exit_on_stdout_error(e);
+    }
+}
+
+/// Raw bytes to stdout, written and flushed with the same handling as [`outln!`].
+pub fn write_stdout_bytes(bytes: &[u8]) {
+    let mut stdout = io::stdout().lock();
+    if let Err(e) = stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        exit_on_stdout_error(e);
+    }
+}
+
+fn exit_on_stdout_error(e: io::Error) -> ! {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("Error: failed writing to stdout: {e}");
+    std::process::exit(1);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputFormat {
     Table,
@@ -64,22 +114,21 @@ pub fn print_output_with_fields(value: &Value, format: OutputFormat, fields: Opt
 
 fn print_json(value: &Value) {
     let out = serde_json::to_string_pretty(value).unwrap_or_default();
-    println!("{out}");
+    crate::outln!("{out}");
 }
 
 fn print_ndjson(value: &Value) {
     if let Some(items) = collection_items(value) {
         for item in items {
-            println!("{}", serde_json::to_string(item).unwrap_or_default());
+            crate::outln!("{}", serde_json::to_string(item).unwrap_or_default());
         }
     } else {
-        println!("{}", serde_json::to_string(value).unwrap_or_default());
+        crate::outln!("{}", serde_json::to_string(value).unwrap_or_default());
     }
 }
 
 fn print_raw(value: &Value) {
-    print!("{}", serde_json::to_string(value).unwrap_or_default());
-    let _ = io::stdout().flush();
+    write_stdout_bytes(serde_json::to_string(value).unwrap_or_default().as_bytes());
 }
 
 fn print_table(value: &Value, fields: Option<&[String]>) {
@@ -92,7 +141,7 @@ fn print_table(value: &Value, fields: Option<&[String]>) {
                 // Table mode fell through to raw JSON. serde escapes C0/C1
                 // inside strings but emits bidi controls verbatim, so this is
                 // not a no-op even though it usually looks like one.
-                println!("{}", terminal_text(&value.to_string()));
+                crate::outln!("{}", terminal_text(&value.to_string()));
             }
             return;
         }
@@ -106,7 +155,7 @@ fn print_table(value: &Value, fields: Option<&[String]>) {
         select_columns(&items)
     };
     if columns.is_empty() {
-        println!(
+        crate::outln!(
             "{}",
             terminal_text(&serde_json::to_string_pretty(value).unwrap_or_default())
         );
@@ -137,7 +186,7 @@ fn print_table(value: &Value, fields: Option<&[String]>) {
 
     let mut table = builder.build();
     table.with(Style::rounded());
-    println!("{table}");
+    crate::outln!("{table}");
 }
 
 fn print_single_object(obj: &serde_json::Map<String, Value>) {
@@ -152,7 +201,7 @@ fn print_single_object(obj: &serde_json::Map<String, Value>) {
 
     let mut table = builder.build();
     table.with(Style::rounded());
-    println!("{table}");
+    crate::outln!("{table}");
 }
 
 fn print_metadata(value: &Value) {

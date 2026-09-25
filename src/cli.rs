@@ -62,7 +62,7 @@ impl RunContext {
     /// catalog. It is JSON by construction, so `--jq` always applies.
     pub fn print(&self, value: &serde_json::Value) -> Result<()> {
         if let Some(ref expression) = self.jq {
-            print!("{}", crate::jq::filter(expression, value)?);
+            crate::output::write_stdout_bytes(crate::jq::filter(expression, value)?.as_bytes());
             return Ok(());
         }
         if let Some(ref fields) = self.fields {
@@ -96,7 +96,7 @@ impl RunContext {
     /// contract, and a caller that asked for a preview needs the same shape
     /// whatever else is on the command line.
     pub fn print_envelope(&self, value: &serde_json::Value) {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string_pretty(value).unwrap_or_default()
         );
@@ -383,7 +383,7 @@ impl Cli {
                 skills::SkillsOutput::Structured(value) => ctx.print(&value),
                 skills::SkillsOutput::Markdown(text) => {
                     ctx.reject_jq("a skill document", Some("'ilert skills list -o json'"))?;
-                    print!("{text}");
+                    crate::output::write_stdout_bytes(text.as_bytes());
                     Ok(())
                 }
             },
@@ -1108,7 +1108,11 @@ impl Cli {
             .parse()
             .map_err(|_| crate::errors::CliError::user(format!("Unknown shell: {shell}")))?;
         let mut cmd = build_command(&self.cached_index, &self.bootstrap_base_url);
-        clap_complete::generate(shell, &mut cmd, "ilert", &mut std::io::stdout());
+        // Rendered into memory first: `generate` panics on a failed write, and
+        // piping the script into `head` to look at it is a closed pipe.
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut cmd, "ilert", &mut script);
+        crate::output::write_stdout_bytes(&script);
         Ok(())
     }
 
@@ -1872,13 +1876,26 @@ fn help_text(raw: &str) -> String {
     crate::sanitize::terminal_text(raw)
 }
 
+/// [`help_text`] for the long form (`--help`), where a description's line
+/// breaks are its layout and are kept.
+fn long_help_text(raw: &str) -> String {
+    crate::sanitize::terminal_multiline(raw)
+}
+
+/// The short form (`-h`) of a multi-line description: its first line.
+fn short_help_text(raw: &str) -> String {
+    help_text(raw.lines().next().unwrap_or_default().trim_end())
+}
+
 fn build_operation_command(op: &Operation) -> Command {
     let fallback = format!("{} {}", op.method, op.path);
     let about = op.summary.as_deref().unwrap_or(&fallback);
 
     let mut cmd = Command::new(op.action.clone())
         .about(help_text(about))
-        .long_about(help_text(op.description.as_deref().unwrap_or_default()));
+        .long_about(long_help_text(
+            op.description.as_deref().unwrap_or_default(),
+        ));
 
     // `--stdin` supplies the ID for every request it makes, so demanding `--id`
     // as well would be asking for a value that is about to be ignored.
@@ -1898,7 +1915,10 @@ fn build_operation_command(op: &Operation) -> Command {
             .long(param.name.clone())
             .value_name(param_value_name(param));
         if let Some(ref desc) = param.description {
-            arg = arg.help(help_text(desc));
+            arg = arg.help(short_help_text(desc));
+            if desc.contains('\n') {
+                arg = arg.long_help(long_help_text(desc));
+            }
         }
         // A parameter the spec declares as an array is offered as a repeatable
         // flag, because that is what its own help text promises: "You may

@@ -336,15 +336,15 @@ pub fn parse_global_headers(matches: &ArgMatches) -> Result<Vec<(String, String)
 /// or a `\r` in one could forge a header that was never sent — or, with OSC 52,
 /// leave something in the user's clipboard.
 pub fn print_response_meta(status: u16, headers: &[(String, String)]) {
-    println!("HTTP {status}");
+    crate::outln!("HTTP {status}");
     for (name, value) in headers {
-        println!(
+        crate::outln!(
             "{}: {}",
             crate::sanitize::terminal_text(name),
             crate::sanitize::terminal_text(value)
         );
     }
-    println!();
+    crate::outln!();
 }
 
 #[cfg(test)]

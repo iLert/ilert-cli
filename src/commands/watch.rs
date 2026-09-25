@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -25,8 +24,7 @@ pub async fn run_watch(
 
     loop {
         // Clear screen
-        print!("\x1B[2J\x1B[H");
-        std::io::stdout().flush()?;
+        crate::output::write_stdout_bytes(b"\x1B[2J\x1B[H");
 
         // Header
         let now = chrono::Local::now().format("%H:%M:%S");
