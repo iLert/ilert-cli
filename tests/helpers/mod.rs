@@ -109,7 +109,20 @@ impl TestHarness {
     /// for tests about what the *environment* resolves to, where a `--base-url`
     /// override would be the very thing under test.
     pub fn bare_cmd(&self) -> Command {
-        let mut cmd = Command::cargo_bin("ilert").expect("binary not found");
+        Command::from(self.bare_std_cmd())
+    }
+
+    /// [`cmd`](Self::cmd) as a plain `std::process::Command`, for tests that
+    /// need to wire stdio themselves — e.g. a stdout whose reader is already
+    /// gone, which `assert_cmd` cannot express since it always captures.
+    pub fn std_cmd(&self) -> std::process::Command {
+        let mut cmd = self.bare_std_cmd();
+        cmd.args(["--base-url", &self.server.uri()]);
+        cmd
+    }
+
+    fn bare_std_cmd(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("ilert"));
         cmd.env("XDG_CONFIG_HOME", self.config_dir.path())
             .env("XDG_CACHE_HOME", self.cache_dir.path())
             // Use a file-backed secret store so tests stay isolated and never

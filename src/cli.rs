@@ -1309,17 +1309,24 @@ impl Cli {
             )
             .await?;
 
+        if response.status >= 400 {
+            let err = crate::http::http_error(&response);
+            if !include {
+                return Err(err);
+            }
+            // Held while printing, so that a reader hanging up mid-output
+            // still ends in this failure rather than a quiet exit 0.
+            output::hold_failure(err, ctx.format);
+            api::print_response_meta(response.status, &response.headers);
+            let printed = ctx.print_response(&response.body);
+            let err = output::take_held_failure().expect("held above");
+            printed?;
+            return Err(err);
+        }
+
         if include {
             api::print_response_meta(response.status, &response.headers);
         }
-
-        if response.status >= 400 {
-            if include {
-                ctx.print_response(&response.body)?;
-            }
-            return Err(crate::http::http_error(&response));
-        }
-
         ctx.print_response(&response.body)
     }
 

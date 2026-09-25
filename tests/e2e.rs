@@ -2277,6 +2277,59 @@ async fn api_include_keeps_metadata_on_an_error_response() {
         .stdout(predicate::str::contains("not found"));
 }
 
+/// Run with a stdout whose reader has already hung up, as `| head -1` does
+/// once it has its line. Every write fails with a broken pipe, first try.
+fn run_with_closed_stdout(mut cmd: std::process::Command) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    cmd.stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run ilert")
+}
+
+#[tokio::test]
+async fn a_closed_stdout_ends_a_successful_command_quietly() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/alerts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(h.server())
+        .await;
+
+    let mut cmd = h.std_cmd();
+    cmd.args(["api", "/api/alerts", "-i", "--api-key", "test-key"]);
+    let out = run_with_closed_stdout(cmd);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+}
+
+/// A reader hanging up must not turn a request that failed into a success:
+/// `api -i` prints a 404's metadata before failing, and the closed pipe hits
+/// during that output.
+#[tokio::test]
+async fn a_closed_stdout_keeps_a_known_http_failure() {
+    let h = TestHarness::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/alerts/999"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .mount(h.server())
+        .await;
+
+    let mut cmd = h.std_cmd();
+    cmd.args(["api", "/api/alerts/999", "-i", "--api-key", "test-key"]);
+    let out = run_with_closed_stdout(cmd);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("not found"), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+}
+
 #[tokio::test]
 async fn api_verbose_reports_request_headers_without_leaking_credentials() {
     let h = TestHarness::start().await;

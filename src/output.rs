@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::sync::Mutex;
 
 use colored::Colorize;
 use serde_json::Value;
@@ -14,8 +15,9 @@ use crate::sanitize::terminal_text;
 /// `ilert alerts list | head -1` hangs up after one line, and the next write
 /// used to end in a panic trace and exit 101. A reader that stopped reading
 /// has everything it asked for, so that ends the process quietly and
-/// successfully, the way `rg` does. Anything else (a full disk behind a
-/// redirect) is still an error, and is reported as one.
+/// successfully, unless the command had already failed (see
+/// [`hold_failure`]). Anything else (a full disk behind a redirect) is still
+/// an error, and is reported as one.
 ///
 /// Restoring the default `SIGPIPE` disposition would also silence this, but
 /// it applies to every socket in the process as well, and a peer resetting an
@@ -50,12 +52,45 @@ pub fn write_stdout_bytes(bytes: &[u8]) {
     }
 }
 
+/// A failure the command has already decided on, held while it prints output
+/// that comes before it.
+static HELD_FAILURE: Mutex<Option<(anyhow::Error, OutputFormat)>> = Mutex::new(None);
+
+/// Register `err` as the command's outcome before printing output that
+/// precedes it, such as `api --include` showing a 404's status and body.
+///
+/// A reader that hangs up during that output would otherwise end the process
+/// with exit 0, so a pipeline under `pipefail` would see a failed request as
+/// a success. With a failure held, a closed stdout reports it and exits with
+/// its code instead. Take it back with [`take_held_failure`] once the output
+/// is written.
+pub fn hold_failure(err: anyhow::Error, format: OutputFormat) {
+    *HELD_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some((err, format));
+}
+
+pub fn take_held_failure() -> Option<anyhow::Error> {
+    take_held().map(|(err, _)| err)
+}
+
+fn take_held() -> Option<(anyhow::Error, OutputFormat)> {
+    HELD_FAILURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
 fn exit_on_stdout_error(e: io::Error) -> ! {
-    if e.kind() == io::ErrorKind::BrokenPipe {
-        std::process::exit(0);
+    let broken_pipe = e.kind() == io::ErrorKind::BrokenPipe;
+    if !broken_pipe {
+        eprintln!("Error: failed writing to stdout: {e}");
     }
-    eprintln!("Error: failed writing to stdout: {e}");
-    std::process::exit(1);
+    match take_held() {
+        Some((err, format)) => {
+            print_error(&err, format);
+            std::process::exit(crate::errors::exit_code(&err));
+        }
+        None => std::process::exit(if broken_pipe { 0 } else { 1 }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
