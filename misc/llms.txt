@@ -1,0 +1,79 @@
+# ilert
+
+> ilert is an incident management platform for operations teams. It receives events from monitoring tools, turns them into alerts, and notifies whoever is on call by push, SMS, voice call, email or chat, escalating until someone accepts. It also covers on-call schedules, incident coordination, status pages, inbound call routing and AI SRE agents. ilert is developed in Germany and hosted in the EU.
+
+AI agents setting a human up on ilert: read [Get ilert-ready](https://www.ilert.com/agent-ready.md) first. It covers installing the CLI, authenticating, and sending a first alert.
+
+Pages on www.ilert.com are HTML. Every page on docs.ilert.com has a Markdown version at its URL plus `.md`, which is what the documentation links below point to. Prefer those when both exist.
+
+## For agents and developers
+
+- [Get ilert-ready](https://www.ilert.com/agent-ready.md): Step-by-step setup instructions for AI coding agents.
+- [ilert CLI](https://docs.ilert.com/developer-docs/client-libraries/ilert-cli.md): The official CLI. Every API endpoint, built from the OpenAPI spec at runtime. Non-interactive when run by an agent, JSON output, `--dry-run` on resource commands. Install: `curl -sL https://raw.githubusercontent.com/iLert/ilert-cli/master/install.sh | bash -`. Source: [iLert/ilert-cli](https://github.com/iLert/ilert-cli).
+- [ilert MCP server](https://docs.ilert.com/ai-and-agents/mcp/ilert-mcp-server-hosted.md): Hosted MCP endpoint at `https://mcp.ilert.com/mcp` (Streamable HTTP, ilert API key as bearer token) for querying and acting on alerts, incidents, services and schedules.
+- [OpenAPI spec](https://api.ilert.com/api-docs/openapi.json): OpenAPI description of the ilert REST API. Early-access endpoints are in a separate [beta spec](https://api.ilert.com/api/beta/openapi.json).
+- [API reference](https://docs.ilert.com/developer-docs/rest-api/api-reference.md): REST API reference, with [authentication](https://docs.ilert.com/developer-docs/rest-api/api-reference/introduction/authentication.md), [errors](https://docs.ilert.com/developer-docs/rest-api/api-reference/introduction/errors.md) and [team context](https://docs.ilert.com/developer-docs/rest-api/api-reference/introduction/team-context.md).
+- [Event API](https://docs.ilert.com/developer-docs/rest-api/api-reference/events.md): `POST https://api.ilert.com/api/events` with an alert source's integration key to create, accept, resolve or comment on alerts from any system.
+- [Terraform provider](https://docs.ilert.com/developer-docs/terraform/terraform.md): Manage alert sources, escalation policies, schedules, call flows and more as code. Provider source `iLert/ilert`. Existing resources can be [exported to HCL](https://docs.ilert.com/developer-docs/terraform/export-to-terraform.md).
+- [Go client](https://docs.ilert.com/developer-docs/client-libraries/go-client.md): Official Go client, also the backend of the Terraform provider.
+- [JavaScript/Node.js client](https://docs.ilert.com/developer-docs/client-libraries/javascript-node.js-client.md): `npm install ilert`.
+- [Rust client](https://docs.ilert.com/developer-docs/client-libraries/rust-client.md): `cargo add ilert`.
+- [ilagent](https://docs.ilert.com/developer-docs/client-libraries/ilagent.md): Lightweight agent that connects on-premise systems to ilert: forwards events and heartbeats, and delivers ilert events to local targets.
+- [ICL](https://docs.ilert.com/developer-docs/icl-ilert-condition-language.md) and [ITL](https://docs.ilert.com/developer-docs/itl-ilert-template-language.md): ilert's condition and template languages, used in alert source, event flow and alert action settings.
+
+## Documentation
+
+- [ilert docs index](https://docs.ilert.com/llms.txt): Every documentation page, each as Markdown.
+- [ilert docs, full text](https://docs.ilert.com/llms-full.txt): The whole documentation in one file.
+- Ask the docs a question: `GET https://docs.ilert.com/index.md?ask=<question>&goal=<user_goal>` returns a direct answer with excerpts and sources.
+- [Quick start](https://docs.ilert.com/getting-started/quick-start-guide.md): Connect a tool, route its alerts to an on-call responder, and page yourself with a real event.
+- [How events become alerts](https://docs.ilert.com/alerting/overview/understanding-event-flows.md): Every check an event passes through between the sending tool and a notification, in order.
+- [Troubleshooting](https://docs.ilert.com/getting-started/quick-start-guide/troubleshooting.md): Events that never become alerts, alerts that never resolve, notifications that never arrive.
+- [Knowledge base](https://docs.ilert.com/knowledge-base/readme.md): Answers to common questions about onboarding, the platform, alerting, and security and compliance.
+
+## Product
+
+- [Alerting](https://docs.ilert.com/alerting/overview.md): Alert sources receive events from monitoring tools, email, SMS or heartbeats; escalation policies decide who is notified, on which channels, and when.
+- [On-call schedules](https://docs.ilert.com/on-call-management-and-escalations/on-call-schedules.md): Recurring and static schedules, overrides and coverage requests.
+- [Escalation policies](https://docs.ilert.com/on-call-management-and-escalations/escalation-policies.md): Ordered rules targeting users, schedules or teams, each with a timeout.
+- [Event flows](https://docs.ilert.com/alerting/configure-alerting/event-flows.md): A routing layer in front of alert sources: branch on the payload, apply support hours, transform events.
+- [Incidents](https://docs.ilert.com/incidents-and-status-pages/incidents.md): The coordination record above alerts: responders, timeline, incident channels, conference bridges and postmortems.
+- [Status pages](https://docs.ilert.com/incidents-and-status-pages/status-pages.md): Public, private and audience-specific status pages, updated from services and status updates.
+- [Call routing](https://docs.ilert.com/call-routing/getting-started-with-call-routing.md): A phone number that reaches whoever is on call, with IVR menus, voicemail and an AI voice agent.
+- [ChatOps](https://docs.ilert.com/chatops/overview.md): Receive and act on alerts, raise new ones and look up who is on call from Slack, Microsoft Teams or Google Chat.
+- [AI SRE agents](https://docs.ilert.com/ai-and-agents/agents.md): Agents that triage alerts and run root cause analysis using tools from connected MCP servers.
+- [Integrations](https://www.ilert.com/integrations): Inbound integrations for monitoring, observability, ITSM, CI/CD and logging tools, and outbound actions to ticketing and chat. Per-integration setup is in the [docs index](https://docs.ilert.com/llms.txt).
+- [Mobile app](https://docs.ilert.com/mobile-app/getting-started-with-ilert-mobile-app.md): iOS and Android app for receiving and responding to alerts.
+- [Pricing](https://www.ilert.com/pricing): Current plans, add-ons and which features each plan includes.
+
+## Migrating to ilert
+
+- [Migrate to ilert with the CLI](https://docs.ilert.com/developer-docs/client-libraries/ilert-cli/migrate-to-ilert.md): Move an on-call or status page setup onto ilert with the CLI and an AI agent, planned first. Covers the source provider's API key, the agent prompts, review of the plan, and the cut-over.
+- [Migrate from Opsgenie](https://docs.ilert.com/knowledge-base/getting-started-and-onboarding/opsgenie-to-ilert-migration-guide.md): Full guide, plus an [FAQ](https://docs.ilert.com/knowledge-base/getting-started-and-onboarding/opsgenie-migration-faq.md).
+- [Compare ilert](https://www.ilert.com/compare): Index of comparisons between ilert and other incident management, on-call and status page products.
+
+## Security and compliance
+
+- [Trust Center](https://docs.ilert.com/trust-center/readme.md): Starting point for security, compliance, infrastructure and legal documents. Read this before asking.
+- [Security overview](https://docs.ilert.com/trust-center/security/security.md), [security controls](https://docs.ilert.com/trust-center/security/security-controls.md), [penetration testing](https://docs.ilert.com/trust-center/security/penetration-testing.md) and [vulnerability disclosure](https://docs.ilert.com/trust-center/security/vulnerability-disclosure.md).
+- [Compliance](https://docs.ilert.com/trust-center/compliance/compliance.md): Certifications and the regulations ilert supports customers with, each on its own page.
+- [Data hosting and residency](https://docs.ilert.com/trust-center/infrastructure/data-hosting-and-residency.md): Where customer data is stored and processed. See also [availability](https://docs.ilert.com/trust-center/infrastructure/availability.md) and [data retention](https://docs.ilert.com/alerting/overview/data-retention.md).
+- [Data Processing Agreement](https://docs.ilert.com/trust-center/legal/data-processing-agreement.md) and [how to enter into one](https://docs.ilert.com/knowledge-base/security-and-compliance/how-can-i-enter-into-a-data-processing-agreement-with-ilert.md).
+- [Sub-processors](https://docs.ilert.com/trust-center/legal/subprocessors.md): Vendors that process customer data on ilert's behalf.
+- [Terms and conditions](https://docs.ilert.com/trust-center/legal/terms-and-conditions.md) and [privacy policy](https://docs.ilert.com/trust-center/legal/privacy-policy-website.md).
+- [ilert system status](https://status.ilert.com): Current availability of ilert itself.
+
+## Company
+
+- [About us](https://www.ilert.com/about-us): Company background and team.
+- [Contact](https://docs.ilert.com/knowledge-base/contact.md): Sales and support contacts. What support each plan includes is in [this article](https://docs.ilert.com/knowledge-base/getting-started-and-onboarding/how-do-i-contact-support-and-what-support-is-included.md).
+
+## Optional
+
+- [Blog](https://www.ilert.com/blog): Product updates, engineering posts and guides on incident management and on-call.
+- [Guides](https://www.ilert.com/guides): Index of long-form guides on incident management practice, metrics and AI.
+- [Postmortem library](https://www.ilert.com/postmortems): Summaries of public postmortems from other companies: what happened, how it was handled, what changed.
+- [Case studies](https://www.ilert.com/case-studies): Index of customer stories: the problem, how ilert was set up, and the outcome.
+- [Webinars](https://www.ilert.com/webinars): Index of recorded and upcoming webinars.
+- [Glossary](https://www.ilert.com/glossary): Definitions of incident management, on-call, DevOps and IT operations terms.
+- [Careers](https://www.ilert.com/careers) and [press](https://www.ilert.com/press).
