@@ -64,8 +64,16 @@ behaviour the template's `config` cannot express.
 
 | The user wants | Path |
 | --- | --- |
-| A supported vendor with its standard behaviour (the usual case) | **Template as is**: `templateKey` + `config` + `credentialId`, no `steps` |
+| A supported vendor with its standard behaviour (the usual case) | **Template as is**: `templateKey` + `config` + `credentialId`. Leave `steps`, `inbound` and `fieldMapping` out entirely |
 | A supported vendor that should behave differently | **Template + own `steps` and/or `inbound`**: start from the template's full definition (`--full true`) and change it. Your `steps` replace the template's completely |
+
+**Never send a copy of the template's own `steps`, `inbound` or
+`fieldMapping`.** ilert does not compare them with the template: whatever you
+send is saved as the action's own definition and runs instead of the
+template's. A verbatim copy validates and works today, but it is frozen. It
+no longer picks up ilert's changes to the template, and `templateVersion: null`
+stops applying to it. Send these fields only with real changes the human
+asked for.
 | A system with no template: an internal API, a ticketing tool, a runbook endpoint | **No template**: the action defines its own `steps`, over HTTP |
 
 Actions are one-way by default, and that is what most users need. Set up
@@ -81,9 +89,10 @@ reroute, set-service-status) take `config` only, not `steps`.
 # 1. What exists. Do not hard-code the list, it grows.
 ilert actions list-templates --jq '.templates[] | {key, brand, transport, bidirectional, auth: [.authSpec[].kind]}'
 
-# 2. What a template needs, and what it does
+# 2. What a template needs. This is all a template-as-is action uses.
 ilert actions get-templates --key jira_cloud_alert --jq '{config, configSpec, authSpec}'
-ilert actions get-templates --key jira_cloud_alert --full true --jq '{steps, inbound, fieldMapping}'
+#    Only when customizing, as the starting point for your own steps:
+#    ilert actions get-templates --key jira_cloud_alert --full true --jq '{steps, inbound, fieldMapping}'
 
 # 3. A credential: reuse one, or create one (see Credentials)
 ilert credentials list --jq '.[] | {id, name, typeHint, subCategory}'
@@ -126,7 +135,16 @@ The draft check names fields differently from the action:
 | (none) | `externalSystem`: any non-empty value such as `"custom"`. A template-less draft needs it for `referenceWrite` to be checked |
 
 After `create`, read the action back: some templates register things in the
-vendor and write the results into `config`.
+vendor and write the results into `config`. For a template-as-is action,
+also check that it stores no definition of its own:
+
+```sh
+ilert actions get --id <ACTION_ID> --jq '{steps, inbound, fieldMapping}'
+```
+
+All three must be `null`, since a read returns only what the action itself
+stores. If any of them is set, clear it with `"steps": []`, `"inbound": {}` or
+`"fieldMapping": []` (see Updating).
 
 ## Credentials
 
@@ -295,6 +313,12 @@ note on `ACCEPT` / `RESOLVE`), `message` (a fallback for `comment`) and
 `routingKey` (for `REROUTE`). Inbound templates see `payload`, `config`,
 `vendor`, `map` and the `hydrate` reads, not `entity`, `twin` or `signal`.
 
+Keep `inbound.matchBy.externalSystem` as the template's `brand`, written as a
+plain string. ilert stores every twin under the brand, so a callback that
+matches on any other system finds no twin and changes nothing. The validator
+rejects a different plain value, but a templated one (`{{ … }}`) is only
+checked when a callback arrives.
+
 **Echo loops.** A comment ilert posts to the vendor comes back through the
 callback as a new comment. Guard comment steps with
 `signal.origin.system != '<brand>'`, and set `authoredId: "{{ last.body.id }}"`
@@ -308,7 +332,8 @@ into the vendor right away.
 **`PUT /beta/actions/{id}` merges**, unlike the full-replace `PUT` elsewhere
 in the API. Absent fields keep their value. To clear something, send it
 empty: `"credentialId": null`, `"steps": []` (back to the template's),
-`"inbound": {}` (back to the template's). Send `config` as a complete object.
+`"inbound": {}` (back to the template's), `"fieldMapping": []` (back to the
+template's). Send `config` as a complete object.
 `templateVersion: null` follows the latest template version, and a number pins
 one.
 
