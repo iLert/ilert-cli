@@ -117,7 +117,11 @@ ilert alert-sources create --body '{
 }' --jq .integrationKey
 ```
 
-Add `--dry-run` to any of these to see the request without sending it.
+Add `--dry-run` to any of these to see the request without sending it. For
+anything beyond these minimal bodies, get the fields from the request schema
+rather than from a fetched resource:
+`ilert ops show post-alert-sources --jq .requestBodySchema`. A command's `--help`
+names the exact call.
 `integrationType` is `API` for a generic HTTP source. If the events come from a
 tool ilert integrates with (Prometheus, Grafana, Datadog, and many more), use
 that tool's type instead: ilert then parses its payload and groups and resolves

@@ -56,8 +56,9 @@ To keep it in the OS keyring instead, pipe it in once with
 `echo "$ILERT_API_KEY" | ilert auth login --with-token`.
 
 Resources and actions come from the cached spec — `ilert --help` after login lists
-them all, `ilert ops list` shows the raw operations, and `ilert api /any/path` hits
-an endpoint directly.
+them all, `ilert ops list` shows the raw operations, `ilert ops show <id>` shows an
+operation's parameters and request body schema, and `ilert api /any/path` hits an
+endpoint directly.
 
 ## Flags worth knowing
 
@@ -76,7 +77,9 @@ an endpoint directly.
 Destructive commands never prompt when no human is attached — they exit `2` with a
 JSON envelope describing what they refused. `--dry-run` prints that same envelope
 without touching the network or the keyring. `ilert skills list` / `ilert skills show
-<name>` print the bundled migration playbooks or other skills as markdown.
+<name>` print the bundled migration playbooks or other skills as markdown. To build a
+request body, start from the schema in `ilert ops show <id>`, not from a fetched
+resource; a command's `--help` names the exact call.
 
 ## License
 

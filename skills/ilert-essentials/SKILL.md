@@ -28,7 +28,27 @@ the relevant one: they cover the mapping, this covers the platform.
 | **Maintenance Window** | Takes both `services` *and* `alertSources` — communication and suppression in one object |
 | **Deployment Pipeline / Event** | Deploy traffic, on its own ingest endpoint and its own integration key. Not alert traffic |
 
-> Node and enum lists grow; check the api-docs rather than treating these as closed.
+> Node and enum lists grow; check `ilert ops show` rather than treating these as closed.
+
+## Building a request: start from `ilert ops show`
+
+Before writing a `--body` or `--set`, read the operation's request schema. **Do not
+fetch a resource to work out the shape**: responses add read-only fields, omit
+anything behind `?include=`, and show only the options that resource uses.
+
+```sh
+ilert ops list --tag alert-sources --jq '.[] | {id, action}'   # operation IDs
+ilert ops show post-alert-sources --jq .requestBodySchema      # every field, nested types inlined
+```
+
+- `readOnly: true` fields are server-set. Leave them out, along with a top-level `id`,
+  which is often unflagged. A nested `id` (`"escalationPolicy": {"id": 7}`) references
+  another object.
+- `oneOf` lists alternative shapes; a sibling such as `connectorType` usually picks one.
+- A remaining `$ref` marks a recursive type, shaped like the enclosing object of that name.
+
+Fetch a resource only to get current values for an update (`PUT` is a full replace), or
+as a last resort when a schema-based request keeps failing.
 
 ## Behaviour that is not in the field names
 
@@ -130,7 +150,8 @@ collection that changes underneath you can skip or repeat rows.
 `conditions` and schedule `shifts` are omitted unless you ask for them via
 `?include=`. `PUT` is the only update verb and is a **full replace** — so "GET it,
 change one field, PUT it back" drops everything the GET did not return. Most
-`include` fields are sub-dependencies or read-only. Build the PUT body explicitly.
+`include` fields are sub-dependencies or read-only. Build the PUT body explicitly,
+from the `ilert ops show` schema with the current values filled in.
 
 **`null` does not always mean "not configured".** `integrationKey`,
 `integrationUrl` come back `null` for callers without
@@ -275,8 +296,9 @@ to work around.
 * **Path parameters must be a single segment.** `/`, `\`, `.`, `..` and control
   characters are refused; anything else is percent-encoded, so a pre-encoded
   `%2F` becomes a literal and 404s rather than re-targeting the request.
-* **The spec is cached for 24 hours**, so the command tree can lag a fresh API
-  change. `ilert ops list` shows raw operations and `ilert api /any/path` bypasses
+* **The spec is cached for 24 hours**, so the command tree and `ilert ops show`
+  can lag a fresh API change (`ilert config cache refresh` updates them).
+  `ilert ops list` shows raw operations and `ilert api /any/path` bypasses
   the generated tree. `ILERT_NO_BETA_SPEC=1` keeps the beta document out of
   the tree from the next spec fetch onwards (`ilert config cache refresh` to
   apply it now).

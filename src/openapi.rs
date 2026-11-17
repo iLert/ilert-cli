@@ -1355,74 +1355,137 @@ fn extract_parameters(op: &Value, spec: &Value) -> Vec<Parameter> {
 
 /// Resolve `$ref` pointers in a JSON schema against the full OpenAPI spec.
 /// Handles `$ref`, `allOf`, and nested property refs. Limits depth to prevent cycles.
+/// Inline every `$ref` in a request body schema.
+///
+/// `ops show` prints this as the reference for building a request, and nothing
+/// on the command line can follow a pointer into `#/components/schemas`. Every
+/// `$ref` left behind is a nested shape the caller has no way to read, so the
+/// one that stays on purpose is the pointer back to a schema it is already
+/// inside, which is how a recursive type has to end.
 fn resolve_refs(schema: &Value, spec: &Value) -> Value {
-    resolve_refs_depth(schema, spec, 10)
+    RefInliner {
+        spec,
+        open_refs: Vec::new(),
+        expansions_left: MAX_REF_EXPANSIONS,
+    }
+    .inline(schema, MAX_SCHEMA_DEPTH)
 }
 
-fn resolve_refs_depth(schema: &Value, spec: &Value, depth: u32) -> Value {
-    if depth == 0 {
-        return schema.clone();
-    }
+/// How many schema levels a request body is followed down. A cycle ends at the
+/// `open_refs` check long before this; it bounds a document that nests without
+/// repeating itself.
+const MAX_SCHEMA_DEPTH: u32 = 32;
 
-    // Direct $ref
-    if let Some(ref_path) = schema.get("$ref").and_then(|v| v.as_str()) {
-        if let Some(resolved) = follow_ref(ref_path, spec) {
-            return resolve_refs_depth(resolved, spec, depth - 1);
+/// How many `$ref`s one request body may expand. This runs on every invocation,
+/// and stopping cycles is not enough to keep it cheap: schemas that all reference
+/// each other have a factorial number of cycle-free paths. The largest body in
+/// the real API takes a few hundred.
+const MAX_REF_EXPANSIONS: usize = 5_000;
+
+struct RefInliner<'a> {
+    spec: &'a Value,
+    /// The `$ref`s being expanded on the way down to the current schema.
+    open_refs: Vec<String>,
+    expansions_left: usize,
+}
+
+impl RefInliner<'_> {
+    fn inline(&mut self, schema: &Value, depth: u32) -> Value {
+        if depth == 0 {
+            return schema.clone();
         }
-        return schema.clone();
-    }
 
-    // allOf — merge all items into a single schema
-    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
-        let mut merged = serde_json::Map::new();
-        let mut merged_props = serde_json::Map::new();
-        let mut merged_required: Vec<Value> = Vec::new();
+        // Direct $ref
+        if let Some(ref_path) = schema.get("$ref").and_then(|v| v.as_str()) {
+            if self.expansions_left == 0 || self.open_refs.iter().any(|open| open == ref_path) {
+                return schema.clone();
+            }
+            let spec = self.spec;
+            let Some(resolved) = follow_ref(ref_path, spec) else {
+                return schema.clone();
+            };
+            self.expansions_left -= 1;
+            self.open_refs.push(ref_path.to_string());
+            let result = self.inline(resolved, depth - 1);
+            self.open_refs.pop();
+            return result;
+        }
 
-        for item in all_of {
-            let resolved_item = resolve_refs_depth(item, spec, depth - 1);
-            if let Some(obj) = resolved_item.as_object() {
-                if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
-                    for (k, v) in props {
-                        merged_props.insert(k.clone(), resolve_refs_depth(v, spec, depth - 1));
+        let Some(obj) = schema.as_object() else {
+            return schema.clone();
+        };
+
+        // allOf — merge all items into a single schema
+        if let Some(all_of) = obj.get("allOf").and_then(|v| v.as_array()) {
+            let mut merged = serde_json::Map::new();
+            let mut merged_props = serde_json::Map::new();
+            let mut merged_required: Vec<Value> = Vec::new();
+
+            // The keywords beside the `allOf` belong to the merged schema, and
+            // they go last so they win: `{"allOf": [{"$ref": ...}], "readOnly":
+            // true}` is how a spec marks a referenced type read-only on this
+            // one field.
+            let mut siblings = obj.clone();
+            siblings.remove("allOf");
+            let siblings = Value::Object(siblings);
+
+            for item in all_of.iter().chain(std::iter::once(&siblings)) {
+                let resolved_item = self.inline(item, depth - 1);
+                if let Some(obj) = resolved_item.as_object() {
+                    if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+                        merged_props.extend(props.iter().map(|(k, v)| (k.clone(), v.clone())));
                     }
-                }
-                if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
-                    merged_required.extend(req.iter().cloned());
-                }
-                // Copy other fields (type, description, etc.)
-                for (k, v) in obj {
-                    if k != "properties" && k != "required" && k != "allOf" {
-                        merged.insert(k.clone(), v.clone());
+                    if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+                        merged_required.extend(req.iter().cloned());
+                    }
+                    // Copy other fields (type, description, etc.)
+                    for (k, v) in obj {
+                        if k != "properties" && k != "required" && k != "allOf" {
+                            merged.insert(k.clone(), v.clone());
+                        }
                     }
                 }
             }
+
+            if !merged_props.is_empty() {
+                merged.insert("properties".to_string(), Value::Object(merged_props));
+            }
+            if !merged_required.is_empty() {
+                merged.insert("required".to_string(), Value::Array(merged_required));
+            }
+            // Only a default: an `allOf` around an enum is a string, not an object.
+            merged
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String("object".to_string()));
+
+            return Value::Object(merged);
         }
 
-        if !merged_props.is_empty() {
-            merged.insert("properties".to_string(), Value::Object(merged_props));
-        }
-        if !merged_required.is_empty() {
-            merged.insert("required".to_string(), Value::Array(merged_required));
-        }
-        merged.insert("type".to_string(), Value::String("object".to_string()));
-
-        return Value::Object(merged);
-    }
-
-    // Resolve refs inside properties
-    if let Some(obj) = schema.as_object() {
+        // Everywhere a schema can hold another schema. By keyword, not by walking
+        // every value: a property may be *named* `items`, and `default` and
+        // `example` hold data.
         let mut result = obj.clone();
         if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
             let mut resolved_props = serde_json::Map::new();
             for (k, v) in props {
-                resolved_props.insert(k.clone(), resolve_refs_depth(v, spec, depth - 1));
+                resolved_props.insert(k.clone(), self.inline(v, depth - 1));
             }
             result.insert("properties".to_string(), Value::Object(resolved_props));
         }
-        return Value::Object(result);
+        for keyword in ["items", "additionalProperties", "not"] {
+            // `additionalProperties` may also be a plain boolean, which stays.
+            if let Some(sub) = obj.get(keyword).filter(|v| v.is_object()) {
+                result.insert(keyword.to_string(), self.inline(sub, depth - 1));
+            }
+        }
+        for keyword in ["oneOf", "anyOf"] {
+            if let Some(variants) = obj.get(keyword).and_then(|v| v.as_array()) {
+                let resolved = variants.iter().map(|v| self.inline(v, depth - 1)).collect();
+                result.insert(keyword.to_string(), Value::Array(resolved));
+            }
+        }
+        Value::Object(result)
     }
-
-    schema.clone()
 }
 
 /// Resolve a `$ref` wrapper to what it points at, leaving anything else alone.
@@ -1539,6 +1602,185 @@ mod tests {
     /// right is everything that is only a question when there are two of them:
     /// sibling methods, component names, command names, and each document's own
     /// server prefix.
+    /// `ops show` is what an agent builds a request from, and it has no way to
+    /// follow a pointer, so a nested `$ref` is a shape it cannot read at all.
+    mod request_body_schemas {
+        use super::super::resolve_refs;
+        use serde_json::{Value, json};
+
+        fn resolved(schema: Value, schemas: Value) -> Value {
+            resolve_refs(&schema, &json!({"components": {"schemas": schemas}}))
+        }
+
+        fn thing_ref() -> Value {
+            json!({"$ref": "#/components/schemas/Thing"})
+        }
+
+        fn thing() -> Value {
+            json!({"Thing": {"type": "object", "properties": {"id": {"type": "integer"}}}})
+        }
+
+        #[test]
+        fn array_items_are_inlined() {
+            let out = resolved(
+                json!({"properties": {"rules": {"type": "array", "items": thing_ref()}}}),
+                thing(),
+            );
+            assert_eq!(
+                out["properties"]["rules"]["items"]["properties"]["id"]["type"],
+                "integer"
+            );
+        }
+
+        #[test]
+        fn one_of_and_any_of_variants_are_inlined() {
+            for keyword in ["oneOf", "anyOf"] {
+                let out = resolved(json!({keyword: [thing_ref()]}), thing());
+                assert_eq!(out[keyword][0]["properties"]["id"]["type"], "integer");
+            }
+        }
+
+        #[test]
+        fn additional_properties_are_inlined_and_a_boolean_is_left_alone() {
+            let out = resolved(json!({"additionalProperties": thing_ref()}), thing());
+            assert_eq!(
+                out["additionalProperties"]["properties"]["id"]["type"],
+                "integer"
+            );
+
+            let out = resolved(json!({"additionalProperties": false}), thing());
+            assert_eq!(out["additionalProperties"], false);
+        }
+
+        /// Keywords are only keywords where a schema is expected. A field named
+        /// `items` is a field, and a `default` is data that merely looks like one.
+        #[test]
+        fn a_property_named_like_a_keyword_and_a_default_are_not_followed() {
+            let out = resolved(
+                json!({
+                    "properties": {"items": {"type": "string"}},
+                    "default": {"items": thing_ref()},
+                }),
+                thing(),
+            );
+            assert_eq!(out["properties"]["items"]["type"], "string");
+            assert_eq!(out["default"]["items"], thing_ref());
+        }
+
+        /// A schema reached twice along different branches is not a cycle, and
+        /// must be inlined both times.
+        #[test]
+        fn a_schema_used_twice_is_inlined_both_times() {
+            let out = resolved(
+                json!({"properties": {"a": thing_ref(), "b": thing_ref()}}),
+                thing(),
+            );
+            assert_eq!(
+                out["properties"]["a"]["properties"]["id"]["type"],
+                "integer"
+            );
+            assert_eq!(
+                out["properties"]["b"]["properties"]["id"]["type"],
+                "integer"
+            );
+        }
+
+        /// A recursive type ends in a pointer to the schema it is inside, once.
+        #[test]
+        fn a_cycle_stops_at_the_schema_it_returns_to() {
+            let node_ref = json!({"$ref": "#/components/schemas/Node"});
+            let out = resolved(
+                node_ref.clone(),
+                json!({"Node": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "children": {"type": "array", "items": node_ref},
+                    },
+                }}),
+            );
+            assert_eq!(out["properties"]["name"]["type"], "string");
+            assert_eq!(out["properties"]["children"]["items"], node_ref);
+        }
+
+        #[test]
+        fn a_recursive_type_inside_all_of_still_ends_in_a_pointer() {
+            let node_ref = json!({"$ref": "#/components/schemas/Node"});
+            let out = resolved(
+                node_ref.clone(),
+                json!({"Node": {
+                    "allOf": [{"properties": {"next": node_ref}}],
+                }}),
+            );
+            assert_eq!(out["properties"]["next"], node_ref);
+        }
+
+        /// How a spec says a referenced type is read-only on this one field. The
+        /// flag is what tells a caller not to send it.
+        #[test]
+        fn keywords_beside_an_all_of_survive_the_merge() {
+            let out = resolved(
+                json!({
+                    "allOf": [thing_ref()],
+                    "readOnly": true,
+                    "description": "Set by the server",
+                    "properties": {"extra": {"type": "string"}},
+                    "required": ["extra"],
+                }),
+                thing(),
+            );
+            assert_eq!(out["readOnly"], true);
+            assert_eq!(out["description"], "Set by the server");
+            assert_eq!(out["properties"]["id"]["type"], "integer");
+            assert_eq!(out["properties"]["extra"]["type"], "string");
+            assert_eq!(out["required"], json!(["extra"]));
+        }
+
+        /// Twenty schemas that all reference each other contain no cycle a path
+        /// has to repeat for a very long time. Finishing at all is the assertion:
+        /// this runs on every invocation, against a document fetched over the
+        /// network.
+        #[test]
+        fn densely_connected_schemas_stay_bounded() {
+            let names: Vec<String> = (0..20).map(|i| format!("S{i}")).collect();
+            let properties: serde_json::Map<String, Value> = names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        json!({"$ref": format!("#/components/schemas/{n}")}),
+                    )
+                })
+                .collect();
+            let schemas: serde_json::Map<String, Value> = names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        json!({"type": "object", "properties": properties}),
+                    )
+                })
+                .collect();
+
+            let out = resolved(
+                json!({"$ref": "#/components/schemas/S0"}),
+                Value::Object(schemas),
+            );
+            assert_eq!(out["type"], "object");
+            assert!(out["properties"]["S1"]["properties"].is_object());
+        }
+
+        #[test]
+        fn an_all_of_around_an_enum_is_not_turned_into_an_object() {
+            let out = resolved(
+                json!({"allOf": [{"$ref": "#/components/schemas/Kind"}]}),
+                json!({"Kind": {"type": "string", "enum": ["A", "B"]}}),
+            );
+            assert_eq!(out["type"], "string");
+            assert_eq!(out["enum"], json!(["A", "B"]));
+        }
+    }
+
     mod merging {
         use super::super::{build_index, merge_specs, spec_version_display, spec_versions};
         use serde_json::{Value, json};

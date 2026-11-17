@@ -1476,6 +1476,63 @@ async fn ops_show_displays_operation_details() {
         .stdout(predicate::str::contains("GET"));
 }
 
+/// The nested shapes are the part that can't be guessed, and an agent has no
+/// command that follows a `$ref`. Left in, they send it off to fetch a resource
+/// and copy the response.
+#[tokio::test]
+async fn ops_show_inlines_nested_request_schemas() {
+    let h = TestHarness::start().await;
+
+    let output = h
+        .cmd()
+        .args(["ops", "show", "post-escalation-policies", "-o", "json"])
+        .output()
+        .expect("runs");
+    assert!(output.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+
+    let rule = &shown["requestBodySchema"]["properties"]["escalationRules"]["items"];
+    assert!(rule.get("$ref").is_none(), "left a pointer: {rule}");
+    assert!(
+        rule["properties"]["escalationTimeout"].is_object(),
+        "no rule fields: {rule}"
+    );
+}
+
+/// `--help` on a command that takes a body is the moment the schema is needed,
+/// and the operation ID isn't something the command name lets you work out.
+#[tokio::test]
+async fn help_names_the_schema_command_only_where_there_is_a_body() {
+    let h = TestHarness::start().await;
+    h.cmd().args(["ops", "list"]).assert().success();
+
+    h.cmd()
+        .args(["escalation-policies", "create", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ilert ops show post-escalation-policies --jq .requestBodySchema",
+        ));
+
+    h.cmd()
+        .args(["alerts", "list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ilert ops show").not());
+}
+
+/// An operation ID is opaque enough that a wrong one needs a way forward.
+#[tokio::test]
+async fn an_unknown_operation_says_where_to_find_the_ids() {
+    let h = TestHarness::start().await;
+
+    h.cmd()
+        .args(["ops", "show", "createAlertSource"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ilert ops list"));
+}
+
 // ---------------------------------------------------------------------------
 // Nested --set values
 // ---------------------------------------------------------------------------

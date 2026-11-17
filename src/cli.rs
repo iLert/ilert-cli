@@ -1164,9 +1164,10 @@ impl Cli {
             }
             Some(("show", sub)) => {
                 let id = sub.get_one::<String>("operation-id").expect("required");
-                let op = index.by_id.get(id.as_str()).ok_or_else(|| {
-                    crate::errors::CliError::user(format!("Unknown operation: {id}"))
-                })?;
+                let op = index
+                    .by_id
+                    .get(id.as_str())
+                    .ok_or_else(|| crate::errors::CliError::user(unknown_operation(id)))?;
                 let info = serde_json::json!({
                     "id": op.id, "method": op.method, "path": op.path,
                     "tag": op.tag, "action": op.action, "beta": op.beta,
@@ -1201,7 +1202,7 @@ impl Cli {
         let operation = index
             .by_id
             .get(op_id)
-            .ok_or_else(|| CliError::user(format!("Unknown operation: {op_id}")))?;
+            .ok_or_else(|| CliError::user(unknown_operation(op_id)))?;
 
         // Built before anything reaches the keyring or the network: a dry run
         // and a refusal both stop after this point.
@@ -1701,6 +1702,7 @@ fn build_command(index: &Option<OperationIndex>, base_url: &str) -> Command {
             ilert event send -k <KEY> -s \"msg\"       Send an alert event\n  \
             ilert status                             Show system overview\n  \
             ilert dashboard                          Open live TUI dashboard\n  \
+            ilert ops show post-alert-sources        Request schema for building a --body\n  \
             ilert skills show ilert-essentials       Rules and gotchas not covered by --help",
         )
         .arg(
@@ -1894,6 +1896,10 @@ fn short_help_text(raw: &str) -> String {
     help_text(raw.lines().next().unwrap_or_default().trim_end())
 }
 
+fn unknown_operation(id: &str) -> String {
+    format!("Unknown operation: {id}. 'ilert ops list' shows the valid IDs.")
+}
+
 fn build_operation_command(op: &Operation) -> Command {
     let fallback = format!("{} {}", op.method, op.path);
     let about = op.summary.as_deref().unwrap_or(&fallback);
@@ -1950,6 +1956,16 @@ fn build_operation_command(op: &Operation) -> Command {
             }
         }
         cmd = cmd.arg(arg);
+    }
+
+    if op.request_body_schema.is_some() {
+        // Operation IDs can't be guessed from the command name, and this is the
+        // screen an agent reads right before writing a body, so it names the
+        // exact command rather than leaving it to come from a sample resource.
+        cmd = cmd.after_help(format!(
+            "Request body schema: ilert ops show {} --jq .requestBodySchema",
+            help_text(&op.id)
+        ));
     }
 
     if op.has_request_body {
@@ -2257,7 +2273,7 @@ fn build_completions_command() -> Command {
 
 fn build_ops_command() -> Command {
     Command::new("ops")
-        .about("Discover API operations")
+        .about("Discover API operations and their request schemas")
         .arg_required_else_help(true)
         .subcommand(
             Command::new("list")
@@ -2265,19 +2281,21 @@ fn build_ops_command() -> Command {
                 .arg(Arg::new("tag").long("tag").help("Filter by resource tag")),
         )
         .subcommand(
-            Command::new("show").about("Show operation details").arg(
-                Arg::new("operation-id")
-                    .required(true)
-                    .help("Operation ID to inspect"),
-            ),
+            Command::new("show")
+                .about("Show an operation's parameters and request body schema")
+                .arg(
+                    Arg::new("operation-id")
+                        .required(true)
+                        .help("Operation ID to inspect"),
+                ),
         )
         .subcommand(
             Command::new("run")
                 .about("Execute an operation by ID")
                 .after_help(
                     "Examples:\n  \
-                     ilert ops run getAlert --param id=42\n  \
-                     ilert ops run createAlertSource --set name=Prometheus --dry-run\n\n\
+                     ilert ops run get-alerts-id --param id=42\n  \
+                     ilert ops run post-alert-sources --set name=Prometheus --dry-run\n\n\
                      For an endpoint the cached spec does not know about, use 'ilert api <path>'.",
                 )
                 .arg(
