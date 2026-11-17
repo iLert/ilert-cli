@@ -21,7 +21,7 @@ the relevant one: they cover the mapping, this covers the platform.
 | **Incident** | The coordination record above alerts (used on business impact) — multi channel responders, timeline, incident channel. It publishes nothing by itself |
 | **Status update** | The public message posted *from* an incident. This is what reaches status pages and subscribers |
 | **Escalation Policy** | Ordered rules with `escalationTimeout`, targeting users, schedules or teams. Also `repeating` / `frequency`, `delayMin`, `routingKey` |
-| **Schedule** | `STATIC` or `RECURRING`; `RECURRING` carries `scheduleLayers` (at least one), and resolves to **one** person on call — where layers overlap the higher one wins. Overrides go through `PUT /schedules/{id}/overrides` |
+| **Schedule** | `STATIC` or `RECURRING`; `RECURRING` carries `scheduleLayers` (at least one), and resolves to **one** person on call — where layers overlap the higher one wins. Overrides go through `PUT /schedules/{id}/overrides`; who is on call comes from `/on-calls` (below) |
 | **Event Flow** | A routing layer *above* alert sources with its own ingest URL. Nodes: `ROOT`, `DEFINE_BRANCHES`, `ROUTE_EVENT`, `SUPPORT_HOURS`, `WAIT`, `TRANSFORM` |
 | **Call Flow** | The same idea for inbound phone calls: `IVR_MENU`, `AUDIO_MESSAGE`, `SUPPORT_HOURS`, `ROUTE_CALL`, `PARALLEL_ROUTE_CALL`, `VOICEMAIL`, `PIN_CODE`, `CREATE_ALERT`, `BLOCK_NUMBERS`, `AGENTIC` |
 | **Alert Action + Connector** | Outbound automation. The Connector holds credentials, the Alert Action binds it to a source with `triggerMode`, `triggerTypes` and ICL `conditions` |
@@ -52,6 +52,22 @@ ilert ops show post-alert-sources --jq .requestBodySchema      # every field, ne
 
 Fetch a resource only to get current values for an update (`PUT` is a full replace), or
 as a last resort when a schema-based request keeps failing.
+
+## Who is on call: ask `/on-calls`, not the schedules
+
+For "am I / who is on call", start with `/on-calls`; do not walk schedules and
+shifts. The server resolves policy levels, layers, overrides and direct user or
+team targets for you.
+
+```sh
+ilert on-call now                                        # right now
+ilert on-calls list --users "$(ilert whoami --jq .id)"   # am I? [] = no
+ilert on-calls list --schedules <id> --from <iso> --until <iso> --all
+```
+
+- No `from`/`until` means "now"; the span is capped at three months.
+- Only policies used by an alert source count, within your team context.
+- One entry per policy, level and shift: de-duplicate users before counting.
 
 ## Behaviour that is not in the field names
 
