@@ -3240,6 +3240,70 @@ async fn a_post_that_only_queries_is_reported_read_only() {
     assert_eq!(envelope["classification"]["destructive"], false);
 }
 
+/// The beta successor of `post-alerts-id-actions`, classified through the merged
+/// command tree: running an action opens the ticket or fires the webhook, so it
+/// is gated like its predecessor, while the two validators only answer a verdict.
+#[tokio::test]
+async fn beta_action_operations_are_classified_by_the_beta_table() {
+    let h = TestHarness::start_with_beta().await;
+    h.seed_cache().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/beta/actions/7/activations"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({"activationId": 1})))
+        .expect(0)
+        .mount(h.server())
+        .await;
+
+    let out = h
+        .cmd()
+        .env("ILERT_CLI_MODE", "agent")
+        .args([
+            "ops",
+            "run",
+            "post-beta-actions-id-activations",
+            "--param",
+            "id=7",
+            "--body",
+            r#"{"entityType":"ALERT","entityId":42}"#,
+            "--api-key",
+            "test-key",
+            "-o",
+            "json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stderr).expect("a refusal emits the envelope on stderr");
+    assert_eq!(envelope["status"], "confirmation_required");
+    assert_eq!(envelope["classification"]["destructive"], true);
+
+    let out = h
+        .cmd()
+        .args([
+            "ops",
+            "run",
+            "post-beta-actions-templates-validate",
+            "--body",
+            r#"{"entityKind":"ALERT"}"#,
+            "--dry-run",
+            "-o",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("dry run emits JSON on stdout");
+    assert_eq!(envelope["classification"]["read_only"], true);
+    assert_eq!(envelope["classification"]["destructive"], false);
+}
+
 // ---------------------------------------------------------------------------
 // Credentials never come from config.json
 // ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@
 //! idempotent, and a non-`DELETE` action may still destroy data. So the method
 //! table below is only a starting point — a spec can carry an
 //! `x-ilert-cli-classification` extension per operation, and
-//! [`OPERATION_OVERRIDES`] is the fallback for specs that cannot yet carry it.
+//! [`OPERATION_OVERRIDES`] (with [`BETA_OPERATION_OVERRIDES`] for the beta
+//! document) is the fallback for specs that cannot yet carry it.
 //!
 //! The confirmation flow in `cli.rs` gates on `destructive`, so this is the one
 //! place that decides what needs a `--yes`.
@@ -13,7 +14,7 @@
 //! # Confirmation policy
 //!
 //! **A write is not destructive by default. `DELETE` is, and so is anything
-//! named in [`OPERATION_OVERRIDES`].**
+//! named in [`OPERATION_OVERRIDES`] or [`BETA_OPERATION_OVERRIDES`].**
 //!
 //! `POST` and `PUT` therefore go through without confirmation unless listed.
 //! This is a deliberate choice, not an oversight of the spec: creating an alert
@@ -259,6 +260,53 @@ pub const OPERATION_OVERRIDES: &[(&str, Classification)] = &[
     ),
 ];
 
+/// [`OPERATION_OVERRIDES`] for the beta document, reviewed against the same
+/// policy, and consulted **only** for operations that document contributed.
+///
+/// It cannot live in the stable table. Every id there is reserved before a
+/// beta operation claims its own (`openapi::reserved_operation_ids`), which
+/// is what stops a beta endpoint from inheriting a stable entry's
+/// classification. Listing a beta id there would therefore push its operation
+/// under the `beta.` namespace, and the override would never match. In the
+/// other direction, a stable operation never consults this table, so naming
+/// one of these ids buys a stable document nothing.
+///
+/// Beta contracts move faster than stable ones, so expect this table to change
+/// more often. `stale_beta_overrides_are_rejected` checks it against the beta
+/// fixture, which carries a stand-in for each listed operation.
+pub const BETA_OPERATION_OVERRIDES: &[(&str, Classification)] = &[
+    // -- Irreversible outward effects ---------------------------------------
+    // POST /beta/actions/{id}/activations — runs an action on an alert or
+    // incident: opens the ticket, fires the webhook, sends the email. It also
+    // stays attached to that entity, so the entity's later changes trigger it
+    // again. The successor of `post-alerts-id-actions`, gated for the same reason.
+    (
+        "post-beta-actions-id-activations",
+        Classification::new(false, true, false),
+    ),
+    // PUT /beta/actions/{id}/rotate-integration-key — the old callback URL
+    // stops working immediately, and the vendor keeps calling it. Two-way sync
+    // breaks silently until someone updates the vendor's webhook settings.
+    // Not idempotent: every call mints a new key.
+    (
+        "put-beta-actions-id-rotate-integration-key",
+        Classification::new(false, true, false),
+    ),
+    // -- Reads behind a POST ------------------------------------------------
+    // POST /beta/actions/templates/validate — checks an action draft and
+    // answers with a verdict. Saves nothing.
+    (
+        "post-beta-actions-templates-validate",
+        Classification::new(true, false, true),
+    ),
+    // POST /beta/actions/condition/validate — checks a trigger condition as
+    // the calling user. Saves nothing.
+    (
+        "post-beta-actions-condition-validate",
+        Classification::new(true, false, true),
+    ),
+];
+
 /// Resolve the final classification for a spec operation.
 ///
 /// Precedence: method default → `x-ilert-cli-classification` extension →
@@ -300,6 +348,17 @@ pub fn resolve_with(
 /// [`resolve_with`] against the shipped override table.
 pub fn for_operation(method: &str, operation_id: &str, op_value: &Value) -> Result<Classification> {
     resolve_with(method, operation_id, op_value, OPERATION_OVERRIDES)
+}
+
+/// [`resolve_with`] for an operation the beta document contributed, against
+/// [`BETA_OPERATION_OVERRIDES`]. `operation_id` is the id the operation was
+/// indexed under, after any `beta.` namespacing.
+pub fn for_beta_operation(
+    method: &str,
+    operation_id: &str,
+    op_value: &Value,
+) -> Result<Classification> {
+    resolve_with(method, operation_id, op_value, BETA_OPERATION_OVERRIDES)
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +460,9 @@ mod tests {
 
     /// The real spec, also used by the e2e suite.
     const SPEC: &str = include_str!("../tests/fixtures/openapi.json");
+
+    /// The beta companion fixture, also used by the e2e suite.
+    const BETA_SPEC: &str = include_str!("../tests/fixtures/beta.json");
 
     #[test]
     fn method_defaults_match_the_documented_table() {
@@ -673,6 +735,97 @@ mod tests {
             assert!(c.read_only, "{id} should be read-only");
             assert!(!c.destructive, "{id} should not require confirmation");
         }
+    }
+
+    #[test]
+    fn stale_beta_overrides_are_rejected() {
+        let spec: Value = serde_json::from_str(BETA_SPEC).expect("beta fixture is valid JSON");
+        let known = operation_ids(&spec);
+        for (id, _) in BETA_OPERATION_OVERRIDES {
+            assert!(
+                known.contains(&id.to_string()),
+                "beta classification override references unknown operationId '{id}'; \
+                 add a stand-in for it to tests/fixtures/beta.json or drop the entry"
+            );
+        }
+    }
+
+    /// A beta id in the stable table would be reserved, so its own operation
+    /// would be indexed as `beta.<id>` and never match the entry.
+    #[test]
+    fn beta_overrides_stay_out_of_the_stable_table() {
+        for (id, _) in BETA_OPERATION_OVERRIDES {
+            assert!(
+                !OPERATION_OVERRIDES.iter().any(|(stable, _)| stable == id),
+                "'{id}' is listed in both override tables"
+            );
+        }
+    }
+
+    /// [`only_the_reviewed_writes_require_confirmation`], for the beta document.
+    #[test]
+    fn only_the_reviewed_beta_writes_require_confirmation() {
+        const EXPECTED: &[&str] = &[
+            "post-beta-actions-id-activations",
+            "put-beta-actions-id-rotate-integration-key",
+        ];
+
+        let spec: Value = serde_json::from_str(BETA_SPEC).expect("beta fixture is valid JSON");
+        let mut destructive = Vec::new();
+        for (id, method, path) in operations(&spec) {
+            if method != "POST" && method != "PUT" {
+                continue;
+            }
+            let op = &spec["paths"][&path][method.to_lowercase()];
+            if for_beta_operation(&method, &id, op).unwrap().destructive {
+                destructive.push(id);
+            }
+        }
+
+        destructive.sort();
+        let mut expected: Vec<String> = EXPECTED.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            destructive, expected,
+            "the set of beta writes requiring --yes changed; review the new operation against \
+             the confirmation policy in this module's docs before updating this list"
+        );
+    }
+
+    #[test]
+    fn the_beta_validators_are_read_only() {
+        let spec: Value = serde_json::from_str(BETA_SPEC).expect("beta fixture is valid JSON");
+        for (id, path) in [
+            (
+                "post-beta-actions-templates-validate",
+                "/beta/actions/templates/validate",
+            ),
+            (
+                "post-beta-actions-condition-validate",
+                "/beta/actions/condition/validate",
+            ),
+        ] {
+            let op = &spec["paths"][path]["post"];
+            let c = for_beta_operation("POST", id, op).unwrap();
+            assert!(c.read_only, "{id} should be read-only");
+            assert!(!c.destructive, "{id} should not require confirmation");
+        }
+    }
+
+    /// Each table answers only for its own document.
+    #[test]
+    fn an_override_table_never_reaches_the_other_document() {
+        let op = json!({});
+        assert_eq!(
+            for_operation("POST", "post-beta-actions-id-activations", &op).unwrap(),
+            Classification::from_method("POST"),
+            "a stable operation borrowed a beta entry"
+        );
+        assert_eq!(
+            for_beta_operation("POST", "post-alerts-id-actions", &op).unwrap(),
+            Classification::from_method("POST"),
+            "a beta operation borrowed a stable entry"
+        );
     }
 
     #[test]

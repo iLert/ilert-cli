@@ -25,6 +25,9 @@ the relevant one: they cover the mapping, this covers the platform.
 | **Event Flow** | A routing layer *above* alert sources with its own ingest URL. Nodes: `ROOT`, `DEFINE_BRANCHES`, `ROUTE_EVENT`, `SUPPORT_HOURS`, `WAIT`, `TRANSFORM` |
 | **Call Flow** | The same idea for inbound phone calls: `IVR_MENU`, `AUDIO_MESSAGE`, `SUPPORT_HOURS`, `ROUTE_CALL`, `PARALLEL_ROUTE_CALL`, `VOICEMAIL`, `PIN_CODE`, `CREATE_ALERT`, `BLOCK_NUMBERS`, `AGENTIC` |
 | **Alert Action + Connector** | Outbound automation. The Connector holds credentials, the Alert Action binds it to a source with `triggerMode`, `triggerTypes` and ICL `conditions` |
+| **Action** (closed beta) | The successor to alert actions: templates or custom HTTP steps, authenticating with a Credential. Accounts without the beta get `404` with a "not available" `message` from `ilert actions list` (`GET /api/beta/actions`) and use alert actions. Accounts with it should prefer actions, though alert actions keep working and remain required for integrations without an action template. See `ilert skills show ilert-actions` |
+| **Credential** (open beta) | A host URL plus a secret that is stored encrypted, never returned and never editable (to rotate, create a new one and repoint its users). Shared by everything that calls out: actions, and the custom MCP servers agents use. `category` shows which kind of user it belongs to (`global-action`, `MCP`). Deleting one breaks whatever references it |
+| **Agent** (open beta) | An AI agent, assigned to teams, `ENABLED` or `DISABLED` (`activate` / `deactivate`). It calls tools on MCP servers, built-in or custom (a custom server is backed by a Credential). Users talk to agents in **conversations**, and a **root cause investigation** is an agent run that looks for the cause behind incidents and alerts. Unrelated to call flows, despite the `AGENTIC` node there |
 | **Maintenance Window** | Takes both `services` *and* `alertSources` — communication and suppression in one object |
 | **Deployment Pipeline / Event** | Deploy traffic, on its own ingest endpoint and its own integration key. Not alert traffic |
 
@@ -226,26 +229,17 @@ in their platform e.g. for alert source event processing or alert action filteri
 
 > Note these are rather large doc pages, so only fetch if needed and potentially pull them temporarily and search within them
 
-### What the CLI treats as destructive
+### What the gate does not cover
 
-A write is **not** destructive by default. `DELETE` is, plus a specific list that
-no HTTP method would tell you:
+You do not need to know in advance which commands are destructive. The CLI
+decides that, and it shows up as the exit `2` above. Besides every `DELETE`,
+the gate covers a few writes whose effect the request does not name, such as
+running an alert action or replacing a set of subscribers.
 
-| Operation | Why |
-| --- | --- |
-| `POST /alerts/{id}/actions` | Fires the webhook, opens the ticket, posts to chat. Nothing unsends it |
-| `POST` / `PUT /service-outages/overrides` | Rewrites public uptime history |
-| `PUT /services/{id}/private-subscribers` | *Set* semantics — everyone omitted is removed |
-| `PUT /status-pages/{id}/private-subscribers` | Same. The sibling `POST` *adds* and is not destructive |
-| `PUT /escalation-policies/{id}/levels/{level}` | Replaces the level, dropping whoever held it, on a paging path |
-
-In reverse, two `POST`s are classified **read-only** because they only query:
-`POST /incidents/publish-info` (which subscribers an incident would reach) and
-`POST /users/search-email`.
-
-Creating an incident or sending an event is outward-facing and irreversible too,
-but is not gated — that is the documented purpose of those commands, and a prompt
-on every write trains people to pass `--yes` unconditionally.
+The gate is deliberately narrow, so its absence is not consent. Creating an
+incident, publishing a status update or sending an event is outward-facing and
+irreversible too, but it goes through without `--yes`, because that is what
+those commands are for. Do these only when the human asked for them.
 
 ### `--all` stops early and only warns on stderr
 

@@ -101,6 +101,104 @@
           }
         ]
       }
+    },
+    "/beta/actions/{id}/activations": {
+      "post": {
+        "tags": [
+          "Actions"
+        ],
+        "summary": "Run an action",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/beta/actions/{id}/rotate-integration-key": {
+      "put": {
+        "tags": [
+          "Actions"
+        ],
+        "summary": "Rotate the integration key of an action",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
+    "/beta/actions/templates/validate": {
+      "post": {
+        "tags": [
+          "Actions"
+        ],
+        "summary": "Validate an action draft",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/beta/actions/condition/validate": {
+      "post": {
+        "tags": [
+          "Actions"
+        ],
+        "summary": "Validate a trigger condition",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IlertBetaHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

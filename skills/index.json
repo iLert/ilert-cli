@@ -2,6 +2,11 @@
   "version": 1,
   "skills": [
     {
+      "name": "ilert-actions",
+      "description": "Build, customize and debug ilert actions (outbound integrations): templates, credentials, custom HTTP steps, bidirectional callbacks",
+      "path": "ilert-actions/SKILL.md"
+    },
+    {
       "name": "ilert-essentials",
       "description": "Core ilert concepts and CLI behaviour: the object model and the rules behind the field names",
       "path": "ilert-essentials/SKILL.md"

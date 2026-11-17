@@ -1066,7 +1066,13 @@ fn build_index(spec: &Value) -> Result<OperationIndex> {
                 request_body_schema,
                 has_request_body,
                 request_body_required,
-                classification: classification::for_operation(method, &operation_id, op_value)?,
+                // Each document is classified against its own reviewed table:
+                // a stable entry cannot reach a beta operation (its id was
+                // reserved above), and a beta entry cannot reach a stable one.
+                classification: match beta {
+                    true => classification::for_beta_operation(method, &operation_id, op_value)?,
+                    false => classification::for_operation(method, &operation_id, op_value)?,
+                },
                 beta,
             };
 
