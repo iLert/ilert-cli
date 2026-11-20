@@ -212,7 +212,54 @@ async fn try_check_cli() -> Result<()> {
 }
 
 /// Ask GitHub for the tag of the latest release.
-async fn fetch_latest_version() -> Result<String> {
+///
+/// The releases API first, then the `releases/latest` redirect on github.com —
+/// the same lookup `install.sh` makes. The API allows 60 unauthenticated
+/// requests an hour per IP, which a shared office or CI address exhausts
+/// easily, and the redirect is not counted against that limit.
+pub(crate) async fn fetch_latest_version() -> Result<String> {
+    match fetch_latest_from_api().await {
+        Ok(tag) => Ok(tag),
+        Err(api_err) => fetch_latest_from_redirect()
+            .await
+            .map_err(|redirect_err| anyhow::anyhow!("{api_err}; {redirect_err}")),
+    }
+}
+
+async fn fetch_latest_from_redirect() -> Result<String> {
+    let client = crate::client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/latest");
+    let resp = client.head(&url).send().await?;
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("github.com answered {} with no redirect", resp.status()))?;
+
+    tag_from_release_url(location)
+        .ok_or_else(|| anyhow::anyhow!("github.com redirected somewhere unexpected"))
+}
+
+/// The version out of `…/releases/tag/<tag>`, or `None` for anything else —
+/// with no release published, `latest` redirects to the release list instead.
+fn tag_from_release_url(location: &str) -> Option<String> {
+    let (_, tag) = location
+        .trim_end_matches('/')
+        .rsplit_once("/releases/tag/")?;
+    let version = tag.trim_start_matches('v');
+    let looks_like_version = !version.is_empty()
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    looks_like_version.then(|| version.to_string())
+}
+
+async fn fetch_latest_from_api() -> Result<String> {
     let client = crate::client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
@@ -234,9 +281,11 @@ async fn fetch_latest_version() -> Result<String> {
     let latest_tag = release
         .get("tag_name")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .map(|tag| tag.trim_start_matches('v'))
+        .filter(|tag| !tag.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("the releases API answered with no tag_name"))?;
 
-    Ok(latest_tag.trim_start_matches('v').to_string())
+    Ok(latest_tag.to_string())
 }
 
 /// Start the interval before making the request it belongs to.
@@ -300,7 +349,7 @@ fn cli_update_notice(latest: &str) -> String {
     )
 }
 
-fn is_newer_semver(latest: &str, current: &str) -> bool {
+pub(crate) fn is_newer_semver(latest: &str, current: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
     parse(latest) > parse(current)
 }
@@ -682,5 +731,26 @@ mod tests {
             api_update_notice("1.0.0", "1.1.0"),
             "Note: API spec updated: 1.0.0 -> 1.1.0"
         );
+    }
+
+    #[test]
+    fn the_latest_tag_is_read_from_the_release_redirect() {
+        let base = "https://github.com/iLert/ilert-cli/releases";
+        assert_eq!(
+            tag_from_release_url(&format!("{base}/tag/0.7.0")).as_deref(),
+            Some("0.7.0")
+        );
+        assert_eq!(
+            tag_from_release_url(&format!("{base}/tag/v1.2.3/")).as_deref(),
+            Some("1.2.3")
+        );
+        // No release published: `latest` lands on the list, not a tag.
+        assert_eq!(tag_from_release_url(base), None);
+        // Anything that is not a plain version stays out of the terminal.
+        assert_eq!(
+            tag_from_release_url(&format!("{base}/tag/9.9.9\u{1b}]52;x")),
+            None
+        );
+        assert_eq!(tag_from_release_url(&format!("{base}/tag/")), None);
     }
 }

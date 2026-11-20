@@ -3996,8 +3996,10 @@ async fn update_refuses_to_run_the_installer_without_consent() {
     // A test run is not a terminal, so this is the CI/agent path: the command
     // replaces the binary that is running, and nothing here can answer a
     // prompt. Refusing early also means the installer is never fetched.
+    // `--force` skips the latest-release lookup, which would otherwise reach
+    // GitHub and end early whenever this build is already current.
     h.cmd()
-        .args(["update"])
+        .args(["update", "--force"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--yes"));

@@ -28,21 +28,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
 use anyhow::Result;
-use clap::{ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use colored::Colorize;
 
 use crate::cli::RunContext;
+use crate::commands::version;
 use crate::config::ConfigManager;
 use crate::errors::CliError;
+use crate::sanitize::terminal_text;
 
 /// The installer, as it stood when this binary was built.
 const INSTALLER: &[u8] = include_bytes!("../../install.sh");
 
 pub fn command() -> Command {
-    Command::new("update").about("Update the CLI to the latest release")
+    Command::new("update")
+        .about("Update the CLI to the latest release")
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .help("Reinstall the latest release even if this binary is already on it"),
+        )
 }
 
-pub async fn handle(_matches: &ArgMatches, ctx: &RunContext) -> Result<()> {
+pub async fn handle(matches: &ArgMatches, ctx: &RunContext) -> Result<()> {
     if cfg!(windows) {
         return Err(CliError::user(
             "`ilert update` runs the POSIX installer, which supports macOS and Linux only. \
@@ -84,6 +93,34 @@ pub async fn handle(_matches: &ArgMatches, ctx: &RunContext) -> Result<()> {
             manager.upgrade_hint
         ))
         .into());
+    }
+
+    // Nothing to do when this binary already is the latest release. Checked
+    // before the prompt, so nobody is asked to confirm a download that would
+    // only put the same version back. The installer cannot make this call: it
+    // knows the latest tag but not which version it is replacing.
+    //
+    // A failed check is not a reason to stop. The installer resolves the
+    // latest release on its own, through github.com rather than the API, so a
+    // rate-limited or unreachable API says nothing about whether it can.
+    let current = version::current_version();
+    if !matches.get_flag("force") {
+        match version::fetch_latest_version().await {
+            Ok(latest) if !latest.is_empty() && !version::is_newer_semver(&latest, current) => {
+                eprintln!(
+                    "ilert {} is already the latest release ({}). \
+                     Run `ilert update --force` to reinstall it anyway.",
+                    current.bold(),
+                    terminal_text(&latest)
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "{} could not check the latest release ({e}); continuing with the installer.",
+                "Warning:".yellow().bold()
+            ),
+        }
     }
 
     consent(ctx, &target)?;
