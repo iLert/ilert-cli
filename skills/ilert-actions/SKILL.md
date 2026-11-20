@@ -146,6 +146,36 @@ All three must be `null`, since a read returns only what the action itself
 stores. If any of them is set, clear it with `"steps": []`, `"inbound": {}` or
 `"fieldMapping": []` (see Updating).
 
+## Config
+
+`configSpec` is the form for the action's `config`, with one entry per key:
+
+| `configSpec` entry | Meaning |
+| --- | --- |
+| `key` | The `config` key it writes |
+| `type` | The shape of the value (see below) |
+| `required` | Must be set, unless `visibleWhen` hides the field |
+| `default` | What the web app prefills. **It is not applied at run time.** The validator still counts it as meeting `required`, so write the value into `config` yourself, as the web app does. Only keys in the template's own `config` fill in for missing ones |
+| `selectOptions` | The allowed values: `key` is stored, `label` is shown |
+| `fetch` | The options come from the vendor instead: read them with `get-options`, after setting every field in `dependsOn` |
+| `visibleWhen: {field, in}` | Shown, required and checked only while `field` holds one of the values in `in` |
+| `group` | The key of the `switchableGroup` field this one sits under |
+| `templated` | The value may contain `{{ }}`, rendered against the alert. A `type: template` field always may |
+| `triggerEvent` | A checkbox that, while ticked, also subscribes the action to that event |
+| `readOnly` | Set by ilert. Never write it |
+
+| `type` | Value in `config` |
+| --- | --- |
+| `text`, `password`, `select`, `template` | string |
+| `number`, `long` | number |
+| `ilertEntity` | number: the id of the ilert entity named by `entityType` |
+| `checkbox`, `switchableGroup` | boolean |
+| `chips`, `slist`, `ilist`, `keyValue` | array, even for a single value |
+| `decisionTable` | array of `{conditionICL, outcome}`, first match wins, at most 50 rules, each `outcome` one of `selectOptions` |
+
+A key that `configSpec` does not declare (a typo) gets only a validator
+**warning**, and nothing reads it. Treat that warning as an error.
+
 ## Credentials
 
 Each `authSpec` entry of a template is one accepted credential kind and lists
@@ -213,7 +243,7 @@ under **Action definition**.
 - **Absent, not null.** Missing fields are left out: test with `!= nil` and
   render with `.orElse("…")`.
 - **`config` values are strings in ICL** (`config.pushComments == 'true'`),
-  but are saved typed per `configSpec`: a checkbox takes a JSON boolean.
+  but are saved typed per `configSpec` (see Config): a checkbox takes a JSON boolean.
 - With `Content-Type: application/json`, values rendered into `body` are
   JSON-escaped for you. Write `"{{ entity.summary }}"` as is.
 - To avoid escaping JSON inside JSON by hand, keep a long body in its own file
