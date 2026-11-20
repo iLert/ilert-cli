@@ -97,7 +97,15 @@ gh release create "$VERSION" \
   --notes ""
 
 echo "==> Dispatching ${WORKFLOW}"
-gh workflow run "$WORKFLOW" --ref "$BRANCH" -f tag="$VERSION"
+# Remember the newest existing dispatch run, so the poll below can tell the run
+# this dispatch creates apart from an earlier one (e.g. a cancelled attempt).
+previous_run_id=$(gh run list --workflow="$WORKFLOW" --branch "$BRANCH" --event workflow_dispatch \
+  --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+dispatch_output=$(gh workflow run "$WORKFLOW" --ref "$BRANCH" -f tag="$VERSION" 2>&1) ||
+  { echo "$dispatch_output" >&2; die "could not dispatch ${WORKFLOW}"; }
+echo "$dispatch_output"
+# Recent gh versions print the URL of the created run; trust that when present.
+run_id=$(sed -n 's|.*/actions/runs/\([0-9][0-9]*\).*|\1|p' <<<"$dispatch_output" | head -1)
 
 if [ "$WATCH" -eq 0 ]; then
   echo
@@ -106,17 +114,22 @@ if [ "$WATCH" -eq 0 ]; then
   exit 0
 fi
 
-# The dispatch returns before the run is queued, so the id has to be polled for.
-echo -n "Waiting for the run to appear"
-run_id=""
-for _ in $(seq 1 30); do
-  run_id=$(gh run list --workflow="$WORKFLOW" --branch "$BRANCH" --event workflow_dispatch \
-    --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-  [ -n "$run_id" ] && break
-  echo -n "."
-  sleep 2
-done
-echo
+# Older gh does not print the run URL, and the dispatch returns before the run
+# is queued, so poll for a run newer than the one seen before dispatching.
+if [ -z "$run_id" ]; then
+  echo -n "Waiting for the run to appear"
+  for _ in $(seq 1 30); do
+    candidate=$(gh run list --workflow="$WORKFLOW" --branch "$BRANCH" --event workflow_dispatch \
+      --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+    if [ -n "$candidate" ] && [ "$candidate" != "$previous_run_id" ]; then
+      run_id="$candidate"
+      break
+    fi
+    echo -n "."
+    sleep 2
+  done
+  echo
+fi
 
 if [ -z "$run_id" ]; then
   echo "Could not find the run — check https://github.com/$(gh repo view --json nameWithOwner --jq .nameWithOwner)/actions"
